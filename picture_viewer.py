@@ -60,6 +60,9 @@ ACCENT = "#7aa2f7"
 ACCENT_HOVER = "#9bb9ff"
 ACCENT_TEXT = "#0b1120"
 SIDEBAR_WIDTH = 248
+SIDEBAR_MIN_WIDTH = 180
+SIDEBAR_MAX_WIDTH = 640
+SIDEBAR_ROW_HEIGHT = 22
 
 MIN_ZOOM = 0.001
 MAX_ZOOM = 32.0
@@ -484,6 +487,10 @@ class PictureViewerApp:
         self._loader = ImageLoader(self._events)
         self._last_dir = Path.home()
 
+        self._sidebar_dragging = False
+        self._sidebar_drag_origin = 0
+        self._sidebar_drag_width = SIDEBAR_WIDTH
+
         self._canvas_size = (0, 0)
         self._render_job: str | None = None
         self._fit_retry_job: str | None = None
@@ -740,8 +747,18 @@ class PictureViewerApp:
 
         self._build_sidebar(self.content)
 
-        sidebar_divider = tk.Frame(self.content, bg=BORDER, width=1)
-        sidebar_divider.grid(row=0, column=1, sticky="ns")
+        self.sidebar_splitter = tk.Frame(
+            self.content,
+            bg=BORDER,
+            width=6,
+            cursor="sb_h_double_arrow",
+        )
+        self.sidebar_splitter.grid(row=0, column=1, sticky="ns")
+        self.sidebar_splitter.bind("<Enter>", self._on_splitter_enter)
+        self.sidebar_splitter.bind("<Leave>", self._on_splitter_leave)
+        self.sidebar_splitter.bind("<ButtonPress-1>", self._on_splitter_press)
+        self.sidebar_splitter.bind("<B1-Motion>", self._on_splitter_motion)
+        self.sidebar_splitter.bind("<ButtonRelease-1>", self._on_splitter_release)
 
         self.canvas = tk.Canvas(
             self.content,
@@ -863,7 +880,7 @@ class PictureViewerApp:
             borderwidth=0,
             relief="flat",
             font=self._font(9),
-            rowheight=22,
+            rowheight=SIDEBAR_ROW_HEIGHT,
             indent=15,
         )
         style.map(
@@ -893,6 +910,7 @@ class PictureViewerApp:
         )
         self.folder_tree.column("#0", width=190, minwidth=100, stretch=True)
         self.folder_tree.grid(row=0, column=0, sticky="nsew")
+        self.folder_tree.bind("<Configure>", self._on_folder_tree_configure, add="+")
 
         self.sidebar_scrollbar = tk.Canvas(
             list_area,
@@ -1136,6 +1154,10 @@ class PictureViewerApp:
 
         element = str(self.folder_tree.identify_element(event.x, event.y))
         if "indicator" in element:
+            if self.folder_tree.get_children(item_id) and bool(
+                self.folder_tree.item(item_id, "open")
+            ):
+                self._schedule_tree_item_top(item_id)
             self.canvas.focus_set()
             return "break"
 
@@ -1148,7 +1170,9 @@ class PictureViewerApp:
             self.canvas.focus_set()
             return "break"
 
-        if self.folder_tree.get_children(item_id):
+        had_children = bool(self.folder_tree.get_children(item_id))
+        was_open = bool(self.folder_tree.item(item_id, "open"))
+        if had_children and not was_open:
             self.folder_tree.item(item_id, open=True)
 
         start = self._folder_first_index[item_id]
@@ -1161,8 +1185,43 @@ class PictureViewerApp:
                 self.navigate_to(start)
             else:
                 self._sync_sidebar_selection()
+        if had_children and not was_open:
+            self._schedule_tree_item_top(item_id)
         self.canvas.focus_set()
         return "break"
+
+    def _schedule_tree_item_top(self, item_id: str) -> None:
+        try:
+            self.root.after_idle(
+                lambda: self._scroll_tree_item_to_top(item_id)
+            )
+        except tk.TclError:
+            pass
+
+    def _scroll_tree_item_to_top(self, item_id: str) -> None:
+        try:
+            if not self.folder_tree.exists(item_id):
+                return
+            for _attempt in range(2):
+                self.folder_tree.update_idletasks()
+                bbox = self.folder_tree.bbox(item_id)
+                if not bbox:
+                    return
+                offset = bbox[1]
+                if offset <= 1:
+                    return
+                first, last = self.folder_tree.yview()
+                span = last - first
+                height = self.folder_tree.winfo_height()
+                if span <= 0.0 or height <= 1:
+                    return
+                shift = (offset / height) * span
+                target = min(max(0.0, first + shift), max(0.0, 1.0 - span))
+                if math.isclose(target, first, abs_tol=1e-9):
+                    return
+                self.folder_tree.yview_moveto(target)
+        except tk.TclError:
+            pass
 
     def _on_sidebar_wheel(self, event: tk.Event, direction: int | None = None) -> str:
         if not self._folder_first_index:
@@ -1177,6 +1236,53 @@ class PictureViewerApp:
             steps = -direction
         self.folder_tree.yview_scroll(steps, "units")
         return "break"
+
+    def _on_folder_tree_configure(self, event: tk.Event) -> None:
+        width = max(80, event.width - 2)
+        try:
+            current = int(float(self.folder_tree.column("#0", "width")))
+        except (tk.TclError, TypeError, ValueError):
+            current = -1
+        if current != width:
+            self.folder_tree.column("#0", width=width, stretch=True)
+
+    def _on_splitter_enter(self, _event: tk.Event) -> None:
+        if not self._sidebar_dragging:
+            self.sidebar_splitter.configure(bg=SURFACE_HOVER)
+
+    def _on_splitter_leave(self, _event: tk.Event) -> None:
+        if not self._sidebar_dragging:
+            self.sidebar_splitter.configure(bg=BORDER)
+
+    def _sidebar_width_limit(self) -> int:
+        content_width = self.content.winfo_width()
+        return max(
+            SIDEBAR_MIN_WIDTH,
+            min(SIDEBAR_MAX_WIDTH, content_width - 360),
+        )
+
+    def _on_splitter_press(self, event: tk.Event) -> None:
+        self._sidebar_dragging = True
+        self._sidebar_drag_origin = event.x_root
+        self._sidebar_drag_width = self.sidebar.winfo_width()
+        self.sidebar_splitter.configure(bg=ACCENT)
+
+    def _on_splitter_motion(self, event: tk.Event) -> None:
+        if not self._sidebar_dragging:
+            return
+        width = (
+            self._sidebar_drag_width
+            + int(event.x_root)
+            - int(self._sidebar_drag_origin)
+        )
+        width = max(SIDEBAR_MIN_WIDTH, min(self._sidebar_width_limit(), width))
+        self.sidebar.configure(width=width)
+
+    def _on_splitter_release(self, _event: tk.Event) -> None:
+        if not self._sidebar_dragging:
+            return
+        self._sidebar_dragging = False
+        self.sidebar_splitter.configure(bg=SURFACE_HOVER)
 
     def _on_folder_scroll(self, first: str, last: str) -> None:
         try:
