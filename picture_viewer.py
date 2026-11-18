@@ -1072,6 +1072,9 @@ class PictureViewerApp:
             self.canvas.focus_set()
             return "break"
 
+        if self.folder_tree.get_children(item_id):
+            self.folder_tree.item(item_id, open=True)
+
         start = self._folder_first_index[item_id]
         selection = self.folder_tree.selection()
         if selection:
