@@ -1171,7 +1171,7 @@ class PictureViewerApp:
         if "indicator" in element:
             opened = bool(self.folder_tree.item(item_id, "open"))
             if opened:
-                self._show_sticky_folder(item_id)
+                self._sync_sticky_to_current_image()
                 self._schedule_tree_item_top(item_id)
             else:
                 self._hide_sticky_if_collapsed(item_id)
@@ -1192,7 +1192,7 @@ class PictureViewerApp:
         if had_children:
             if not was_open:
                 self.folder_tree.item(item_id, open=True)
-            self._show_sticky_folder(item_id)
+            self._sync_sticky_to_current_image()
 
         start = self._folder_first_index[item_id]
         selection = self.folder_tree.selection()
@@ -1209,12 +1209,17 @@ class PictureViewerApp:
         self.canvas.focus_set()
         return "break"
 
-    def _show_sticky_folder(self, item_id: str) -> None:
-        path = self._folder_item_paths.get(item_id)
-        if path is None:
+    def _sync_sticky_to_current_image(self) -> None:
+        if self.source is None or not self.images or self.index < 0:
+            self._hide_sticky_folder()
+            return
+        current_folder = self.images[self.index].parent
+        item_id = self._folder_items_by_path.get(current_folder)
+        if item_id is None:
+            self._hide_sticky_folder()
             return
         self._sticky_folder_item = item_id
-        self._sticky_folder_path = path
+        self._sticky_folder_path = current_folder
         self._schedule_pinned_row_update()
 
     def _hide_sticky_folder(self) -> None:
@@ -1972,6 +1977,7 @@ class PictureViewerApp:
             pass
         self._set_toolbar_state()
         self._fit_to_window_now()
+        self._sync_sticky_to_current_image()
 
     def _handle_image_failed(self, token: int, path: Path, message: str) -> None:
         if self._closed or token != self._load_token:
@@ -1981,6 +1987,7 @@ class PictureViewerApp:
         self.metadata = None
         self._clear_canvas_image()
         self._hide_loading_pill()
+        self._hide_sticky_folder()
         self.zoom_label.configure(text="—")
         self.meta_label.configure(text="无法载入")
         self.canvas.configure(cursor="arrow")
