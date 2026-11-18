@@ -21,7 +21,7 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, ttk
 from typing import Callable, Sequence
 
 try:
@@ -834,28 +834,47 @@ class PictureViewerApp:
         list_area.grid_rowconfigure(0, weight=1)
         list_area.grid_columnconfigure(0, weight=1)
 
-        self._folder_yview = (0.0, 1.0)
-        self.folder_listbox = tk.Listbox(
-            list_area,
-            width=1,
-            height=1,
-            bg=SIDEBAR_BG,
-            fg=MUTED,
-            selectbackground=SIDEBAR_SELECT,
-            selectforeground=TEXT,
-            disabledforeground=MUTED_DIM,
-            highlightthickness=0,
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure(
+            "Sidebar.Treeview",
+            background=SIDEBAR_BG,
+            fieldbackground=SIDEBAR_BG,
+            foreground=MUTED,
             borderwidth=0,
-            selectborderwidth=0,
             relief="flat",
-            activestyle="none",
-            exportselection=False,
-            selectmode="browse",
             font=self._font(9),
+            rowheight=22,
+            indent=15,
+        )
+        style.map(
+            "Sidebar.Treeview",
+            background=[("selected", SIDEBAR_SELECT)],
+            foreground=[("selected", TEXT)],
+        )
+        style.layout(
+            "Sidebar.Treeview",
+            [("Treeview.treearea", {"sticky": "nswe"})],
+        )
+
+        self._folder_yview = (0.0, 1.0)
+        self._folder_items_by_path: dict[Path, str] = {}
+        self._folder_first_index: dict[str, int] = {}
+        self._folder_item_paths: dict[str, Path] = {}
+
+        self.folder_tree = ttk.Treeview(
+            list_area,
+            show="tree",
+            selectmode="browse",
+            style="Sidebar.Treeview",
             cursor="hand2",
             takefocus=0,
         )
-        self.folder_listbox.grid(row=0, column=0, sticky="nsew")
+        self.folder_tree.column("#0", width=190, minwidth=100, stretch=True)
+        self.folder_tree.grid(row=0, column=0, sticky="nsew")
 
         self.sidebar_scrollbar = tk.Canvas(
             list_area,
@@ -866,7 +885,7 @@ class PictureViewerApp:
             cursor="hand2",
         )
         self.sidebar_scrollbar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
-        self.folder_listbox.configure(yscrollcommand=self._on_folder_scroll)
+        self.folder_tree.configure(yscrollcommand=self._on_folder_scroll)
         self.sidebar_scrollbar.bind(
             "<Configure>", lambda _event: self._draw_sidebar_scrollbar()
         )
@@ -888,30 +907,26 @@ class PictureViewerApp:
         )
         self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
 
-        self.folder_listbox.bind("<ButtonRelease-1>", self._on_sidebar_click)
-        self.folder_listbox.bind("<MouseWheel>", self._on_sidebar_wheel)
-        self.folder_listbox.bind(
+        self.folder_tree.bind("<ButtonRelease-1>", self._on_sidebar_click)
+        self.folder_tree.bind("<MouseWheel>", self._on_sidebar_wheel)
+        self.folder_tree.bind(
             "<Button-4>", lambda event: self._on_sidebar_wheel(event, 1)
         )
-        self.folder_listbox.bind(
+        self.folder_tree.bind(
             "<Button-5>", lambda event: self._on_sidebar_wheel(event, -1)
         )
 
-    def _sidebar_folder_label(self, folder: Path) -> str:
-        if self.root_path is None:
-            return str(folder)
-        try:
-            relative = folder.relative_to(self.root_path)
-        except ValueError:
-            return folder.name or str(folder)
-        if str(relative) == ".":
-            return "根目录"
-        return relative.as_posix()
-
     def _clear_sidebar(self, summary: str, empty_message: str) -> None:
-        self.folder_listbox.delete(0, tk.END)
-        self.folder_listbox.selection_clear(0, tk.END)
-        self.folder_listbox.yview_moveto(0)
+        children = self.folder_tree.get_children("")
+        if children:
+            self.folder_tree.delete(*children)
+        selection = self.folder_tree.selection()
+        if selection:
+            self.folder_tree.selection_remove(*selection)
+        self._folder_items_by_path.clear()
+        self._folder_first_index.clear()
+        self._folder_item_paths.clear()
+        self.folder_tree.yview_moveto(0)
         self._folder_yview = (0.0, 1.0)
         self._draw_sidebar_scrollbar()
         self.sidebar_summary.configure(text=summary)
@@ -922,58 +937,146 @@ class PictureViewerApp:
             self.sidebar_empty.place_forget()
 
     def _populate_sidebar(self) -> None:
-        self.folder_listbox.delete(0, tk.END)
-        for folder, start, end in self.folder_groups:
-            label = self._sidebar_folder_label(folder)
-            self.folder_listbox.insert(
-                tk.END, f"  {label}    ·  {end - start}"
-            )
-        if self.folder_groups:
-            self.sidebar_empty.place_forget()
-            self.sidebar_summary.configure(
-                text=(
-                    f"{len(self.folder_groups)} 个目录"
-                    f"  ·  {len(self.images)} 张图片"
-                )
-            )
-        else:
+        children = self.folder_tree.get_children("")
+        if children:
+            self.folder_tree.delete(*children)
+        self._folder_items_by_path.clear()
+        self._folder_first_index.clear()
+        self._folder_item_paths.clear()
+
+        if not self.folder_groups or self.root_path is None:
             self.sidebar_summary.configure(text="没有可显示的目录")
             self.sidebar_empty.configure(text="这个文件夹里没有可显示的图片")
             self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
-        self.folder_listbox.yview_moveto(0)
+            self._folder_yview = (0.0, 1.0)
+            self._draw_sidebar_scrollbar()
+            return
+
+        root = self.root_path
+        nodes: dict[Path, dict] = {}
+
+        def ensure_node(path: Path) -> dict:
+            if path not in nodes:
+                nodes[path] = {
+                    "path": path,
+                    "children": set(),
+                    "start": None,
+                    "end": None,
+                }
+            return nodes[path]
+
+        ensure_node(root)
+        for folder, start, end in self.folder_groups:
+            try:
+                folder.relative_to(root)
+            except ValueError:
+                continue
+            node = ensure_node(folder)
+            node["start"] = start
+            node["end"] = end
+            current = folder
+            while current != root:
+                parent = current.parent
+                ensure_node(parent)["children"].add(current)
+                current = parent
+
+        def prepare(path: Path) -> tuple[int, int]:
+            node = nodes[path]
+            direct = (
+                node["end"] - node["start"]
+                if node["start"] is not None
+                else 0
+            )
+            first = node["start"]
+            ordered = sorted(
+                node["children"],
+                key=lambda item: (natural_key(item.name), item.name),
+            )
+            for child in ordered:
+                child_first, child_total = prepare(child)
+                if first is None or child_first < first:
+                    first = child_first
+                direct += child_total
+            node["ordered"] = ordered
+            node["first"] = first
+            node["total"] = direct
+            return first if first is not None else 0, direct
+
+        prepare(root)
+
+        counter = 0
+
+        def insert_node(path: Path, parent_id: str = "") -> None:
+            nonlocal counter
+            node = nodes[path]
+            label = root.name if path == root else path.name
+            if not label:
+                label = str(path)
+            item_id = f"folder-{counter}"
+            counter += 1
+            item_text = f"{label}    ·  {node['total']}"
+            self.folder_tree.insert(
+                parent_id,
+                "end",
+                iid=item_id,
+                text=item_text,
+                open=(path == root),
+            )
+            self._folder_items_by_path[path] = item_id
+            self._folder_first_index[item_id] = int(node["first"])
+            self._folder_item_paths[item_id] = path
+            for child in node["ordered"]:
+                insert_node(child, item_id)
+
+        insert_node(root)
+        self.sidebar_empty.place_forget()
+        self.sidebar_summary.configure(
+            text=(
+                f"{len(nodes)} 个目录"
+                f"  ·  {len(self.images)} 张图片"
+            )
+        )
+        self.folder_tree.yview_moveto(0)
+        self._folder_yview = (0.0, 1.0)
         self._draw_sidebar_scrollbar()
         self._sync_sidebar_selection()
 
     def _sync_sidebar_selection(self) -> None:
-        if not self.folder_groups or self.index < 0:
-            self.folder_listbox.selection_clear(0, tk.END)
+        if not self.images or self.index < 0:
+            selection = self.folder_tree.selection()
+            if selection:
+                self.folder_tree.selection_remove(*selection)
             return
-        for row, (_folder, start, end) in enumerate(self.folder_groups):
-            if start <= self.index < end:
-                if row < self.folder_listbox.size():
-                    self.folder_listbox.selection_clear(0, tk.END)
-                    self.folder_listbox.selection_set(row)
-                    self.folder_listbox.activate(row)
-                    self.folder_listbox.see(row)
-                return
+        current_folder = self.images[self.index].parent
+        item_id = self._folder_items_by_path.get(current_folder)
+        if item_id is None:
+            return
+
+        parent = self.folder_tree.parent(item_id)
+        while parent:
+            self.folder_tree.item(parent, open=True)
+            parent = self.folder_tree.parent(parent)
+
+        selection = self.folder_tree.selection()
+        if selection:
+            self.folder_tree.selection_remove(*selection)
+        self.folder_tree.selection_set(item_id)
+        self.folder_tree.see(item_id)
 
     def _on_sidebar_click(self, event: tk.Event) -> str:
-        if not self.folder_groups:
+        item_id = self.folder_tree.identify_row(event.y)
+        if not item_id or item_id not in self._folder_first_index:
             return "break"
-        row = self.folder_listbox.nearest(event.y)
-        if row < 0 or row >= len(self.folder_groups):
-            return "break"
-        bbox = self.folder_listbox.bbox(row)
-        if bbox is None:
-            return "break"
-        _x, top, _width, height = bbox
-        if not (top <= event.y <= top + height):
+        element = str(self.folder_tree.identify_element(event.x, event.y))
+        if "indicator" in element:
+            self.canvas.focus_set()
             return "break"
 
-        _folder, start, _end = self.folder_groups[row]
-        self.folder_listbox.selection_clear(0, tk.END)
-        self.folder_listbox.selection_set(row)
-        self.folder_listbox.activate(row)
+        start = self._folder_first_index[item_id]
+        selection = self.folder_tree.selection()
+        if selection:
+            self.folder_tree.selection_remove(*selection)
+        self.folder_tree.selection_set(item_id)
         if start != self.index:
             self.navigate_to(start)
         else:
@@ -982,7 +1085,7 @@ class PictureViewerApp:
         return "break"
 
     def _on_sidebar_wheel(self, event: tk.Event, direction: int | None = None) -> str:
-        if not self.folder_groups:
+        if not self._folder_first_index:
             return "break"
         if direction is None:
             delta = int(getattr(event, "delta", 0))
@@ -992,7 +1095,7 @@ class PictureViewerApp:
             steps *= max(1, abs(delta) // 120)
         else:
             steps = -direction
-        self.folder_listbox.yview_scroll(steps, "units")
+        self.folder_tree.yview_scroll(steps, "units")
         return "break"
 
     def _on_folder_scroll(self, first: str, last: str) -> None:
@@ -1040,7 +1143,7 @@ class PictureViewerApp:
         height = max(1, self.sidebar_scrollbar.winfo_height())
         top = event.y / height - visible / 2
         top = max(0.0, min(1.0 - visible, top))
-        self.folder_listbox.yview_moveto(top)
+        self.folder_tree.yview_moveto(top)
         return "break"
 
     def _build_overlay(self) -> None:
@@ -1701,13 +1804,13 @@ class PictureViewerApp:
             self.zoom_label.configure(text=format_zoom(self.zoom))
 
     def _on_mousewheel(self, event: tk.Event) -> str:
-        pointer_x = self.folder_listbox.winfo_pointerx()
-        pointer_y = self.folder_listbox.winfo_pointery()
-        list_x = self.folder_listbox.winfo_rootx()
-        list_y = self.folder_listbox.winfo_rooty()
+        pointer_x = self.folder_tree.winfo_pointerx()
+        pointer_y = self.folder_tree.winfo_pointery()
+        list_x = self.folder_tree.winfo_rootx()
+        list_y = self.folder_tree.winfo_rooty()
         if (
-            list_x <= pointer_x < list_x + self.folder_listbox.winfo_width()
-            and list_y <= pointer_y < list_y + self.folder_listbox.winfo_height()
+            list_x <= pointer_x < list_x + self.folder_tree.winfo_width()
+            and list_y <= pointer_y < list_y + self.folder_tree.winfo_height()
         ):
             return self._on_sidebar_wheel(event)
 
