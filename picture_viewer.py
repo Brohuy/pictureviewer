@@ -492,6 +492,7 @@ class PictureViewerApp:
         self._sidebar_drag_width = SIDEBAR_WIDTH
         self._sticky_folder_item: str | None = None
         self._sticky_folder_path: Path | None = None
+        self._pinned_row_update_job: str | None = None
 
         self._canvas_size = (0, 0)
         self._render_job: str | None = None
@@ -864,37 +865,6 @@ class PictureViewerApp:
         rule = tk.Frame(self.sidebar, bg=BORDER, height=1)
         rule.pack(fill="x", padx=12)
 
-        self.sticky_header = tk.Frame(self.sidebar, bg=SIDEBAR_SELECT)
-        self.sticky_label = tk.Label(
-            self.sticky_header,
-            text="",
-            bg=SIDEBAR_SELECT,
-            fg=TEXT,
-            font=self._font(8, "bold"),
-            anchor="w",
-            padx=10,
-            pady=5,
-        )
-        self.sticky_label.pack(side="left", fill="x", expand=True)
-        self.sticky_collapse = tk.Label(
-            self.sticky_header,
-            text="收起",
-            bg=SIDEBAR_SELECT,
-            fg=MUTED,
-            font=self._font(8),
-            padx=9,
-            pady=5,
-            cursor="hand2",
-        )
-        self.sticky_collapse.pack(side="right")
-        self.sticky_collapse.bind("<Button-1>", self._on_sticky_collapse)
-        self.sticky_collapse.bind(
-            "<Enter>", lambda _event: self.sticky_collapse.configure(fg=TEXT)
-        )
-        self.sticky_collapse.bind(
-            "<Leave>", lambda _event: self.sticky_collapse.configure(fg=MUTED)
-        )
-
         self.list_area = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
         self.list_area.pack(fill="both", expand=True, padx=(10, 4), pady=(10, 12))
         self.list_area.grid_rowconfigure(0, weight=1)
@@ -984,6 +954,16 @@ class PictureViewerApp:
         self.folder_tree.bind(
             "<Button-5>", lambda event: self._on_sidebar_wheel(event, -1)
         )
+
+        self.pinned_row = tk.Canvas(
+            self.list_area,
+            bg=SIDEBAR_BG,
+            highlightthickness=0,
+            borderwidth=0,
+            height=SIDEBAR_ROW_HEIGHT,
+            cursor="hand2",
+        )
+        self.pinned_row.bind("<Button-1>", self._on_pinned_row_click)
 
     def _clear_sidebar(self, summary: str, empty_message: str) -> None:
         self._hide_sticky_folder()
@@ -1235,32 +1215,12 @@ class PictureViewerApp:
             return
         self._sticky_folder_item = item_id
         self._sticky_folder_path = path
-        if self.root_path is not None:
-            try:
-                relative = path.relative_to(self.root_path)
-            except ValueError:
-                label = path.name or str(path)
-            else:
-                label = (
-                    "根目录"
-                    if str(relative) == "."
-                    else relative.as_posix()
-                )
-        else:
-            label = path.name or str(path)
-        self.sticky_label.configure(text=f"置顶 · {label}")
-        if not self.sticky_header.winfo_manager():
-            self.sticky_header.pack(
-                fill="x",
-                padx=(10, 4),
-                pady=(8, 0),
-                before=self.list_area,
-            )
+        self._schedule_pinned_row_update()
 
     def _hide_sticky_folder(self) -> None:
         self._sticky_folder_item = None
         self._sticky_folder_path = None
-        self.sticky_header.pack_forget()
+        self._hide_pinned_row()
 
     def _hide_sticky_if_collapsed(self, item_id: str) -> None:
         if self._sticky_folder_path is None:
@@ -1274,11 +1234,95 @@ class PictureViewerApp:
             return
         self._hide_sticky_folder()
 
-    def _on_sticky_collapse(self, _event: tk.Event | None = None) -> str:
+    def _schedule_pinned_row_update(self) -> None:
+        if self._pinned_row_update_job is not None or self._closed:
+            return
+        try:
+            self._pinned_row_update_job = self.root.after_idle(
+                self._update_pinned_row_visibility
+            )
+        except tk.TclError:
+            self._pinned_row_update_job = None
+
+    def _update_pinned_row_visibility(self) -> None:
+        self._pinned_row_update_job = None
         item_id = self._sticky_folder_item
+        if item_id is None or not self.folder_tree.exists(item_id):
+            self._hide_pinned_row()
+            return
+        try:
+            if not bool(self.folder_tree.item(item_id, "open")):
+                self._hide_pinned_row()
+                return
+            bbox = self.folder_tree.bbox(item_id)
+        except tk.TclError:
+            return
+        if not bbox or bbox[1] < 0:
+            self._show_pinned_row(item_id)
+        else:
+            self._hide_pinned_row()
+
+    def _show_pinned_row(self, item_id: str) -> None:
+        path = self._folder_item_paths.get(item_id)
+        if path is None or self.root_path is None:
+            return
+        try:
+            relative = path.relative_to(self.root_path)
+        except ValueError:
+            depth = 0
+        else:
+            depth = 0 if str(relative) == "." else len(relative.parts)
+
+        text = self.folder_tree.item(item_id, "text")
+        selected = item_id in self.folder_tree.selection()
+        background = SIDEBAR_SELECT if selected else SIDEBAR_BG
+        foreground = TEXT if selected else MUTED
+        width = max(1, self.folder_tree.winfo_width())
+
+        canvas = self.pinned_row
+        canvas.configure(width=width, bg=background)
+        canvas.place(
+            x=0,
+            y=0,
+            width=width,
+            height=SIDEBAR_ROW_HEIGHT,
+        )
+        try:
+            canvas.tk.call("raise", canvas._w)
+        except tk.TclError:
+            pass
+        canvas.delete("all")
+        left = 4 + depth * 15
+        canvas.create_polygon(
+            left,
+            8,
+            left + 8,
+            8,
+            left + 4,
+            13,
+            fill=foreground,
+            outline="",
+        )
+        canvas.create_text(
+            left + 15,
+            SIDEBAR_ROW_HEIGHT // 2,
+            text=text,
+            anchor="w",
+            fill=foreground,
+            font=self._font(9),
+        )
+
+    def _hide_pinned_row(self) -> None:
+        pinned = getattr(self, "pinned_row", None)
+        if pinned is not None:
+            pinned.place_forget()
+
+    def _on_pinned_row_click(self, _event: tk.Event | None = None) -> str:
+        item_id = self._sticky_folder_item
+        self._hide_sticky_folder()
         if item_id is not None and self.folder_tree.exists(item_id):
             self.folder_tree.item(item_id, open=False)
-        self._hide_sticky_folder()
+            self.folder_tree.see(item_id)
         self.canvas.focus_set()
         return "break"
 
@@ -1312,6 +1356,7 @@ class PictureViewerApp:
                 if math.isclose(target, first, abs_tol=1e-9):
                     return
                 self.folder_tree.yview_moveto(target)
+            self._schedule_pinned_row_update()
         except tk.TclError:
             pass
 
@@ -1337,6 +1382,10 @@ class PictureViewerApp:
             current = -1
         if current != width:
             self.folder_tree.column("#0", width=width, stretch=True)
+        pinned = getattr(self, "pinned_row", None)
+        if pinned is not None and pinned.winfo_ismapped():
+            pinned.place_configure(width=max(1, event.width))
+        self._schedule_pinned_row_update()
 
     def _on_splitter_enter(self, _event: tk.Event) -> None:
         if not self._sidebar_dragging:
@@ -1382,6 +1431,7 @@ class PictureViewerApp:
         except ValueError:
             return
         self._draw_sidebar_scrollbar()
+        self._schedule_pinned_row_update()
 
     def _draw_sidebar_scrollbar(self) -> None:
         canvas = getattr(self, "sidebar_scrollbar", None)
