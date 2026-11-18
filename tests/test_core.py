@@ -62,6 +62,8 @@ class ScanTests(unittest.TestCase):
             touch(self.root / ".hidden.jpg"),
             touch(self.root / "sub" / ".cache" / "secret.jpg"),
         ]
+        (self.root / "empty").mkdir()
+        (self.root / "sub" / "empty nested").mkdir()
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
@@ -94,6 +96,20 @@ class ScanTests(unittest.TestCase):
         images, _errors = pv.scan_images(self.root)
         self.assertNotIn(self.root / "notes.txt", images)
         self.assertTrue(all(path.suffix.lower() != ".txt" for path in images))
+
+    def test_scan_tree_includes_directories_without_images(self) -> None:
+        images, directories, errors = pv.scan_tree(self.root)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(images), 7)
+        relative_dirs = {
+            path.relative_to(self.root).as_posix() for path in directories
+        }
+        self.assertIn(".", relative_dirs)
+        self.assertIn("empty", relative_dirs)
+        self.assertIn("sub/empty nested", relative_dirs)
+        self.assertIn("sub/a", relative_dirs)
+        self.assertNotIn("sub/.cache", relative_dirs)
 
 
 class FolderGroupsTests(unittest.TestCase):

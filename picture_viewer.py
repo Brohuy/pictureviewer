@@ -117,8 +117,10 @@ def image_sort_key(path: Path, root: Path) -> tuple:
     return parent_key, natural_key(relative.name)
 
 
-def scan_images(root: Path, *, skip_hidden: bool = True) -> tuple[list[Path], list[str]]:
-    """Recursively collect supported images below *root*.
+def scan_tree(
+    root: Path, *, skip_hidden: bool = True
+) -> tuple[list[Path], list[Path], list[str]]:
+    """Recursively collect supported images and all visible directories.
 
     Hidden directories can contain cache or thumbnail files, so they are
     skipped by default. Unreadable directories are reported instead of
@@ -126,6 +128,7 @@ def scan_images(root: Path, *, skip_hidden: bool = True) -> tuple[list[Path], li
     """
     root = Path(root).resolve()
     images: list[Path] = []
+    directories: list[Path] = []
     errors: list[str] = []
 
     def on_error(error: OSError) -> None:
@@ -143,6 +146,7 @@ def scan_images(root: Path, *, skip_hidden: bool = True) -> tuple[list[Path], li
             ]
         dirnames.sort(key=natural_key)
         filenames.sort(key=natural_key)
+        directories.append(Path(dirpath))
 
         for filename in filenames:
             if skip_hidden and filename.startswith("."):
@@ -152,6 +156,17 @@ def scan_images(root: Path, *, skip_hidden: bool = True) -> tuple[list[Path], li
                 images.append(path)
 
     images.sort(key=lambda item: image_sort_key(item, root))
+    directories.sort(
+        key=lambda item: tuple(
+            natural_key(part) for part in item.relative_to(root).parts
+        )
+    )
+    return images, directories, errors
+
+
+def scan_images(root: Path, *, skip_hidden: bool = True) -> tuple[list[Path], list[str]]:
+    """Recursively collect supported images below *root*."""
+    images, _directories, errors = scan_tree(root, skip_hidden=skip_hidden)
     return images, errors
 
 
@@ -452,6 +467,7 @@ class PictureViewerApp:
         self.root_path: Path | None = None
         self.images: list[Path] = []
         self.folder_groups: list[tuple[Path, int, int]] = []
+        self.folder_directories: list[Path] = []
         self.index = -1
 
         self.source: Image.Image | None = None
@@ -864,6 +880,8 @@ class PictureViewerApp:
         self._folder_items_by_path: dict[Path, str] = {}
         self._folder_first_index: dict[str, int] = {}
         self._folder_item_paths: dict[str, Path] = {}
+        self._image_item_index: dict[str, int] = {}
+        self._image_items_by_path: dict[Path, str] = {}
 
         self.folder_tree = ttk.Treeview(
             list_area,
@@ -926,6 +944,8 @@ class PictureViewerApp:
         self._folder_items_by_path.clear()
         self._folder_first_index.clear()
         self._folder_item_paths.clear()
+        self._image_item_index.clear()
+        self._image_items_by_path.clear()
         self.folder_tree.yview_moveto(0)
         self._folder_yview = (0.0, 1.0)
         self._draw_sidebar_scrollbar()
@@ -943,10 +963,12 @@ class PictureViewerApp:
         self._folder_items_by_path.clear()
         self._folder_first_index.clear()
         self._folder_item_paths.clear()
+        self._image_item_index.clear()
+        self._image_items_by_path.clear()
 
-        if not self.folder_groups or self.root_path is None:
+        if self.root_path is None:
             self.sidebar_summary.configure(text="没有可显示的目录")
-            self.sidebar_empty.configure(text="这个文件夹里没有可显示的图片")
+            self.sidebar_empty.configure(text="打开文件夹后\n在这里切换目录")
             self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
             self._folder_yview = (0.0, 1.0)
             self._draw_sidebar_scrollbar()
@@ -966,6 +988,21 @@ class PictureViewerApp:
             return nodes[path]
 
         ensure_node(root)
+        directory_paths: set[Path] = {root}
+        for path in self.folder_directories:
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            directory_paths.add(path)
+        for path in directory_paths:
+            ensure_node(path)
+            current = path
+            while current != root:
+                parent = current.parent
+                ensure_node(parent)["children"].add(current)
+                current = parent
+
         for folder, start, end in self.folder_groups:
             try:
                 folder.relative_to(root)
@@ -980,7 +1017,7 @@ class PictureViewerApp:
                 ensure_node(parent)["children"].add(current)
                 current = parent
 
-        def prepare(path: Path) -> tuple[int, int]:
+        def prepare(path: Path) -> tuple[int | None, int]:
             node = nodes[path]
             direct = (
                 node["end"] - node["start"]
@@ -994,13 +1031,15 @@ class PictureViewerApp:
             )
             for child in ordered:
                 child_first, child_total = prepare(child)
-                if first is None or child_first < first:
+                if child_first is not None and (
+                    first is None or child_first < first
+                ):
                     first = child_first
                 direct += child_total
             node["ordered"] = ordered
             node["first"] = first
             node["total"] = direct
-            return first if first is not None else 0, direct
+            return first, direct
 
         prepare(root)
 
@@ -1023,10 +1062,25 @@ class PictureViewerApp:
                 open=(path == root),
             )
             self._folder_items_by_path[path] = item_id
-            self._folder_first_index[item_id] = int(node["first"])
+            self._folder_first_index[item_id] = (
+                int(node["first"]) if node["first"] is not None else -1
+            )
             self._folder_item_paths[item_id] = path
             for child in node["ordered"]:
                 insert_node(child, item_id)
+            if node["start"] is not None:
+                for image_index in range(node["start"], node["end"]):
+                    image_path = self.images[image_index]
+                    image_item = f"image-{counter}"
+                    counter += 1
+                    self.folder_tree.insert(
+                        item_id,
+                        "end",
+                        iid=image_item,
+                        text=image_path.name,
+                    )
+                    self._image_item_index[image_item] = image_index
+                    self._image_items_by_path[image_path] = image_item
 
         insert_node(root)
         self.sidebar_empty.place_forget()
@@ -1047,15 +1101,22 @@ class PictureViewerApp:
             if selection:
                 self.folder_tree.selection_remove(*selection)
             return
-        current_folder = self.images[self.index].parent
-        item_id = self._folder_items_by_path.get(current_folder)
-        if item_id is None:
+        current_image = self.images[self.index]
+        folder_item = self._folder_items_by_path.get(current_image.parent)
+        if folder_item is None:
             return
 
-        parent = self.folder_tree.parent(item_id)
+        parent = self.folder_tree.parent(folder_item)
         while parent:
             self.folder_tree.item(parent, open=True)
             parent = self.folder_tree.parent(parent)
+
+        item_id = folder_item
+        image_item = self._image_items_by_path.get(current_image)
+        if image_item is not None and bool(
+            self.folder_tree.item(folder_item, "open")
+        ):
+            item_id = image_item
 
         selection = self.folder_tree.selection()
         if selection:
@@ -1065,10 +1126,25 @@ class PictureViewerApp:
 
     def _on_sidebar_click(self, event: tk.Event) -> str:
         item_id = self.folder_tree.identify_row(event.y)
-        if not item_id or item_id not in self._folder_first_index:
+        if not item_id:
             return "break"
+        if (
+            item_id not in self._folder_first_index
+            and item_id not in self._image_item_index
+        ):
+            return "break"
+
         element = str(self.folder_tree.identify_element(event.x, event.y))
         if "indicator" in element:
+            self.canvas.focus_set()
+            return "break"
+
+        image_index = self._image_item_index.get(item_id)
+        if image_index is not None:
+            if image_index != self.index:
+                self.navigate_to(image_index)
+            else:
+                self._sync_sidebar_selection()
             self.canvas.focus_set()
             return "break"
 
@@ -1080,10 +1156,11 @@ class PictureViewerApp:
         if selection:
             self.folder_tree.selection_remove(*selection)
         self.folder_tree.selection_set(item_id)
-        if start != self.index:
-            self.navigate_to(start)
-        else:
-            self._sync_sidebar_selection()
+        if start >= 0:
+            if start != self.index:
+                self.navigate_to(start)
+            else:
+                self._sync_sidebar_selection()
         self.canvas.focus_set()
         return "break"
 
@@ -1301,6 +1378,7 @@ class PictureViewerApp:
         self.root_path = None
         self.images = []
         self.folder_groups = []
+        self.folder_directories = []
         self.index = -1
         self.source = None
         self.metadata = None
@@ -1386,6 +1464,7 @@ class PictureViewerApp:
         self.root_path = directory
         self.images = []
         self.folder_groups = []
+        self.folder_directories = []
         self.index = -1
         self.source = None
         self.metadata = None
@@ -1422,21 +1501,29 @@ class PictureViewerApp:
 
     def _scan_worker(self, token: int, directory: Path) -> None:
         try:
-            images, errors = scan_images(directory)
-            self._events.put(("scan_ready", token, directory, images, errors))
+            images, directories, errors = scan_tree(directory)
+            self._events.put(
+                ("scan_ready", token, directory, images, directories, errors)
+            )
         except Exception as error:  # noqa: BLE001 - shown to the user
             self._events.put(
                 ("scan_failed", token, directory, str(error) or type(error).__name__)
             )
 
     def _handle_scan_ready(
-        self, token: int, directory: Path, images: list[Path], errors: list[str]
+        self,
+        token: int,
+        directory: Path,
+        images: list[Path],
+        directories: list[Path],
+        errors: list[str],
     ) -> None:
         if self._closed or token != self._scan_token:
             return
 
         self.images = images
         self.folder_groups = build_folder_groups(images)
+        self.folder_directories = directories
         self._populate_sidebar()
         initial = self._pending_initial_path
         self._pending_initial_path = None
@@ -1484,6 +1571,7 @@ class PictureViewerApp:
             return
         self.images = []
         self.folder_groups = []
+        self.folder_directories = []
         self.index = -1
         self._set_toolbar_state()
         self._clear_sidebar("扫描失败", "无法读取此文件夹")
@@ -1596,7 +1684,9 @@ class PictureViewerApp:
 
                 kind = event[0]
                 if kind == "scan_ready":
-                    self._handle_scan_ready(event[1], event[2], event[3], event[4])
+                    self._handle_scan_ready(
+                        event[1], event[2], event[3], event[4], event[5]
+                    )
                 elif kind == "scan_failed":
                     self._handle_scan_failed(event[1], event[2], event[3])
                 elif kind == "image_ready":
