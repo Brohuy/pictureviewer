@@ -490,6 +490,8 @@ class PictureViewerApp:
         self._sidebar_dragging = False
         self._sidebar_drag_origin = 0
         self._sidebar_drag_width = SIDEBAR_WIDTH
+        self._sticky_folder_item: str | None = None
+        self._sticky_folder_path: Path | None = None
 
         self._canvas_size = (0, 0)
         self._render_job: str | None = None
@@ -862,10 +864,41 @@ class PictureViewerApp:
         rule = tk.Frame(self.sidebar, bg=BORDER, height=1)
         rule.pack(fill="x", padx=12)
 
-        list_area = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
-        list_area.pack(fill="both", expand=True, padx=(10, 4), pady=(10, 12))
-        list_area.grid_rowconfigure(0, weight=1)
-        list_area.grid_columnconfigure(0, weight=1)
+        self.sticky_header = tk.Frame(self.sidebar, bg=SIDEBAR_SELECT)
+        self.sticky_label = tk.Label(
+            self.sticky_header,
+            text="",
+            bg=SIDEBAR_SELECT,
+            fg=TEXT,
+            font=self._font(8, "bold"),
+            anchor="w",
+            padx=10,
+            pady=5,
+        )
+        self.sticky_label.pack(side="left", fill="x", expand=True)
+        self.sticky_collapse = tk.Label(
+            self.sticky_header,
+            text="收起",
+            bg=SIDEBAR_SELECT,
+            fg=MUTED,
+            font=self._font(8),
+            padx=9,
+            pady=5,
+            cursor="hand2",
+        )
+        self.sticky_collapse.pack(side="right")
+        self.sticky_collapse.bind("<Button-1>", self._on_sticky_collapse)
+        self.sticky_collapse.bind(
+            "<Enter>", lambda _event: self.sticky_collapse.configure(fg=TEXT)
+        )
+        self.sticky_collapse.bind(
+            "<Leave>", lambda _event: self.sticky_collapse.configure(fg=MUTED)
+        )
+
+        self.list_area = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
+        self.list_area.pack(fill="both", expand=True, padx=(10, 4), pady=(10, 12))
+        self.list_area.grid_rowconfigure(0, weight=1)
+        self.list_area.grid_columnconfigure(0, weight=1)
 
         style = ttk.Style(self.root)
         try:
@@ -901,7 +934,7 @@ class PictureViewerApp:
         self._image_items_by_path: dict[Path, str] = {}
 
         self.folder_tree = ttk.Treeview(
-            list_area,
+            self.list_area,
             show="tree",
             selectmode="browse",
             style="Sidebar.Treeview",
@@ -913,7 +946,7 @@ class PictureViewerApp:
         self.folder_tree.bind("<Configure>", self._on_folder_tree_configure, add="+")
 
         self.sidebar_scrollbar = tk.Canvas(
-            list_area,
+            self.list_area,
             width=5,
             bg=SIDEBAR_BG,
             highlightthickness=0,
@@ -933,7 +966,7 @@ class PictureViewerApp:
         )
 
         self.sidebar_empty = tk.Label(
-            list_area,
+            self.list_area,
             text="打开文件夹后\n在这里切换目录",
             bg=SIDEBAR_BG,
             fg=MUTED_DIM,
@@ -953,6 +986,7 @@ class PictureViewerApp:
         )
 
     def _clear_sidebar(self, summary: str, empty_message: str) -> None:
+        self._hide_sticky_folder()
         children = self.folder_tree.get_children("")
         if children:
             self.folder_tree.delete(*children)
@@ -975,6 +1009,7 @@ class PictureViewerApp:
             self.sidebar_empty.place_forget()
 
     def _populate_sidebar(self) -> None:
+        self._hide_sticky_folder()
         children = self.folder_tree.get_children("")
         if children:
             self.folder_tree.delete(*children)
@@ -1154,10 +1189,12 @@ class PictureViewerApp:
 
         element = str(self.folder_tree.identify_element(event.x, event.y))
         if "indicator" in element:
-            if self.folder_tree.get_children(item_id) and bool(
-                self.folder_tree.item(item_id, "open")
-            ):
+            opened = bool(self.folder_tree.item(item_id, "open"))
+            if opened:
+                self._show_sticky_folder(item_id)
                 self._schedule_tree_item_top(item_id)
+            else:
+                self._hide_sticky_if_collapsed(item_id)
             self.canvas.focus_set()
             return "break"
 
@@ -1172,8 +1209,10 @@ class PictureViewerApp:
 
         had_children = bool(self.folder_tree.get_children(item_id))
         was_open = bool(self.folder_tree.item(item_id, "open"))
-        if had_children and not was_open:
-            self.folder_tree.item(item_id, open=True)
+        if had_children:
+            if not was_open:
+                self.folder_tree.item(item_id, open=True)
+            self._show_sticky_folder(item_id)
 
         start = self._folder_first_index[item_id]
         selection = self.folder_tree.selection()
@@ -1187,6 +1226,59 @@ class PictureViewerApp:
                 self._sync_sidebar_selection()
         if had_children and not was_open:
             self._schedule_tree_item_top(item_id)
+        self.canvas.focus_set()
+        return "break"
+
+    def _show_sticky_folder(self, item_id: str) -> None:
+        path = self._folder_item_paths.get(item_id)
+        if path is None:
+            return
+        self._sticky_folder_item = item_id
+        self._sticky_folder_path = path
+        if self.root_path is not None:
+            try:
+                relative = path.relative_to(self.root_path)
+            except ValueError:
+                label = path.name or str(path)
+            else:
+                label = (
+                    "根目录"
+                    if str(relative) == "."
+                    else relative.as_posix()
+                )
+        else:
+            label = path.name or str(path)
+        self.sticky_label.configure(text=f"置顶 · {label}")
+        if not self.sticky_header.winfo_manager():
+            self.sticky_header.pack(
+                fill="x",
+                padx=(10, 4),
+                pady=(8, 0),
+                before=self.list_area,
+            )
+
+    def _hide_sticky_folder(self) -> None:
+        self._sticky_folder_item = None
+        self._sticky_folder_path = None
+        self.sticky_header.pack_forget()
+
+    def _hide_sticky_if_collapsed(self, item_id: str) -> None:
+        if self._sticky_folder_path is None:
+            return
+        collapsed_path = self._folder_item_paths.get(item_id)
+        if collapsed_path is None:
+            return
+        try:
+            self._sticky_folder_path.relative_to(collapsed_path)
+        except ValueError:
+            return
+        self._hide_sticky_folder()
+
+    def _on_sticky_collapse(self, _event: tk.Event | None = None) -> str:
+        item_id = self._sticky_folder_item
+        if item_id is not None and self.folder_tree.exists(item_id):
+            self.folder_tree.item(item_id, open=False)
+        self._hide_sticky_folder()
         self.canvas.focus_set()
         return "break"
 
