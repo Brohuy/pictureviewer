@@ -50,6 +50,8 @@ BG = "#0e1117"
 SURFACE = "#171c26"
 SURFACE_HOVER = "#202736"
 CANVAS_BG = "#0a0c11"
+SIDEBAR_BG = "#10141c"
+SIDEBAR_SELECT = "#22314f"
 BORDER = "#252c3a"
 TEXT = "#e9edf5"
 MUTED = "#8e98ab"
@@ -57,6 +59,7 @@ MUTED_DIM = "#566073"
 ACCENT = "#7aa2f7"
 ACCENT_HOVER = "#9bb9ff"
 ACCENT_TEXT = "#0b1120"
+SIDEBAR_WIDTH = 248
 
 MIN_ZOOM = 0.001
 MAX_ZOOM = 32.0
@@ -492,7 +495,7 @@ class PictureViewerApp:
     def _configure_window(self) -> None:
         self.root.title(APP_NAME)
         self.root.configure(bg=BG)
-        self.root.minsize(760, 520)
+        self.root.minsize(900, 560)
 
         width, height = 1280, 820
         screen_width = self.root.winfo_screenwidth()
@@ -620,18 +623,6 @@ class PictureViewerApp:
             font=self._font(11, "bold"),
         ).pack(side="left", padx=(9, 0))
 
-        self.open_button = self._make_button(
-            brand_area,
-            "打开文件夹",
-            self.open_folder_dialog,
-            kind="accent",
-            font=self._font(10, "bold"),
-            padx=14,
-            pady=6,
-        )
-        self.open_button.pack(side="left", padx=(18, 0))
-        self._add_tooltip(self.open_button, "打开文件夹 · Ctrl+O")
-
         controls = tk.Frame(self.header, bg=BG)
         controls.pack(side="right", padx=(0, 18))
 
@@ -726,14 +717,24 @@ class PictureViewerApp:
         header_rule = tk.Frame(self.root, bg=BORDER, height=1)
         header_rule.grid(row=1, column=0, sticky="ew")
 
+        self.content = tk.Frame(self.root, bg=CANVAS_BG)
+        self.content.grid(row=2, column=0, sticky="nsew")
+        self.content.grid_rowconfigure(0, weight=1)
+        self.content.grid_columnconfigure(2, weight=1)
+
+        self._build_sidebar(self.content)
+
+        sidebar_divider = tk.Frame(self.content, bg=BORDER, width=1)
+        sidebar_divider.grid(row=0, column=1, sticky="ns")
+
         self.canvas = tk.Canvas(
-            self.root,
+            self.content,
             bg=CANVAS_BG,
             highlightthickness=0,
             borderwidth=0,
             cursor="arrow",
         )
-        self.canvas.grid(row=2, column=0, sticky="nsew")
+        self.canvas.grid(row=0, column=2, sticky="nsew")
 
         self._build_overlay()
         self.loading_pill = tk.Label(
@@ -787,6 +788,260 @@ class PictureViewerApp:
         self.folder_label.pack(side="left", padx=(8, 0))
 
         self._set_toolbar_state()
+
+    def _build_sidebar(self, parent: tk.Misc) -> None:
+        self.sidebar = tk.Frame(parent, bg=SIDEBAR_BG, width=SIDEBAR_WIDTH)
+        self.sidebar.grid(row=0, column=0, sticky="ns")
+        self.sidebar.pack_propagate(False)
+
+        title = tk.Label(
+            self.sidebar,
+            text="目录",
+            bg=SIDEBAR_BG,
+            fg=TEXT,
+            font=self._font(10, "bold"),
+            anchor="w",
+        )
+        title.pack(fill="x", padx=16, pady=(16, 2))
+
+        self.sidebar_summary = tk.Label(
+            self.sidebar,
+            text="",
+            bg=SIDEBAR_BG,
+            fg=MUTED,
+            font=self._font(8),
+            anchor="w",
+        )
+        self.sidebar_summary.pack(fill="x", padx=16, pady=(0, 12))
+
+        self.sidebar_open_button = self._make_button(
+            self.sidebar,
+            "＋ 打开文件夹",
+            self.open_folder_dialog,
+            kind="surface",
+            font=self._font(9, "bold"),
+            padx=10,
+            pady=7,
+        )
+        self.sidebar_open_button.pack(fill="x", padx=12, pady=(0, 12))
+        self._add_tooltip(self.sidebar_open_button, "打开文件夹 · Ctrl+O")
+
+        rule = tk.Frame(self.sidebar, bg=BORDER, height=1)
+        rule.pack(fill="x", padx=12)
+
+        list_area = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
+        list_area.pack(fill="both", expand=True, padx=(10, 4), pady=(10, 12))
+        list_area.grid_rowconfigure(0, weight=1)
+        list_area.grid_columnconfigure(0, weight=1)
+
+        self._folder_yview = (0.0, 1.0)
+        self.folder_listbox = tk.Listbox(
+            list_area,
+            width=1,
+            height=1,
+            bg=SIDEBAR_BG,
+            fg=MUTED,
+            selectbackground=SIDEBAR_SELECT,
+            selectforeground=TEXT,
+            disabledforeground=MUTED_DIM,
+            highlightthickness=0,
+            borderwidth=0,
+            selectborderwidth=0,
+            relief="flat",
+            activestyle="none",
+            exportselection=False,
+            selectmode="browse",
+            font=self._font(9),
+            cursor="hand2",
+            takefocus=0,
+        )
+        self.folder_listbox.grid(row=0, column=0, sticky="nsew")
+
+        self.sidebar_scrollbar = tk.Canvas(
+            list_area,
+            width=5,
+            bg=SIDEBAR_BG,
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="hand2",
+        )
+        self.sidebar_scrollbar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+        self.folder_listbox.configure(yscrollcommand=self._on_folder_scroll)
+        self.sidebar_scrollbar.bind(
+            "<Configure>", lambda _event: self._draw_sidebar_scrollbar()
+        )
+        self.sidebar_scrollbar.bind(
+            "<Button-1>", self._on_sidebar_scrollbar_click
+        )
+        self.sidebar_scrollbar.bind(
+            "<B1-Motion>", self._on_sidebar_scrollbar_click
+        )
+
+        self.sidebar_empty = tk.Label(
+            list_area,
+            text="打开文件夹后\n在这里切换目录",
+            bg=SIDEBAR_BG,
+            fg=MUTED_DIM,
+            font=self._font(9),
+            justify="center",
+            wraplength=180,
+        )
+        self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
+
+        self.folder_listbox.bind("<ButtonRelease-1>", self._on_sidebar_click)
+        self.folder_listbox.bind("<MouseWheel>", self._on_sidebar_wheel)
+        self.folder_listbox.bind(
+            "<Button-4>", lambda event: self._on_sidebar_wheel(event, 1)
+        )
+        self.folder_listbox.bind(
+            "<Button-5>", lambda event: self._on_sidebar_wheel(event, -1)
+        )
+
+    def _sidebar_folder_label(self, folder: Path) -> str:
+        if self.root_path is None:
+            return str(folder)
+        try:
+            relative = folder.relative_to(self.root_path)
+        except ValueError:
+            return folder.name or str(folder)
+        if str(relative) == ".":
+            return "根目录"
+        return relative.as_posix()
+
+    def _clear_sidebar(self, summary: str, empty_message: str) -> None:
+        self.folder_listbox.delete(0, tk.END)
+        self.folder_listbox.selection_clear(0, tk.END)
+        self.folder_listbox.yview_moveto(0)
+        self._folder_yview = (0.0, 1.0)
+        self._draw_sidebar_scrollbar()
+        self.sidebar_summary.configure(text=summary)
+        if empty_message:
+            self.sidebar_empty.configure(text=empty_message)
+            self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
+        else:
+            self.sidebar_empty.place_forget()
+
+    def _populate_sidebar(self) -> None:
+        self.folder_listbox.delete(0, tk.END)
+        for folder, start, end in self.folder_groups:
+            label = self._sidebar_folder_label(folder)
+            self.folder_listbox.insert(
+                tk.END, f"  {label}    ·  {end - start}"
+            )
+        if self.folder_groups:
+            self.sidebar_empty.place_forget()
+            self.sidebar_summary.configure(
+                text=(
+                    f"{len(self.folder_groups)} 个目录"
+                    f"  ·  {len(self.images)} 张图片"
+                )
+            )
+        else:
+            self.sidebar_summary.configure(text="没有可显示的目录")
+            self.sidebar_empty.configure(text="这个文件夹里没有可显示的图片")
+            self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
+        self.folder_listbox.yview_moveto(0)
+        self._draw_sidebar_scrollbar()
+        self._sync_sidebar_selection()
+
+    def _sync_sidebar_selection(self) -> None:
+        if not self.folder_groups or self.index < 0:
+            self.folder_listbox.selection_clear(0, tk.END)
+            return
+        for row, (_folder, start, end) in enumerate(self.folder_groups):
+            if start <= self.index < end:
+                if row < self.folder_listbox.size():
+                    self.folder_listbox.selection_clear(0, tk.END)
+                    self.folder_listbox.selection_set(row)
+                    self.folder_listbox.activate(row)
+                    self.folder_listbox.see(row)
+                return
+
+    def _on_sidebar_click(self, event: tk.Event) -> str:
+        if not self.folder_groups:
+            return "break"
+        row = self.folder_listbox.nearest(event.y)
+        if row < 0 or row >= len(self.folder_groups):
+            return "break"
+        bbox = self.folder_listbox.bbox(row)
+        if bbox is None:
+            return "break"
+        _x, top, _width, height = bbox
+        if not (top <= event.y <= top + height):
+            return "break"
+
+        _folder, start, _end = self.folder_groups[row]
+        self.folder_listbox.selection_clear(0, tk.END)
+        self.folder_listbox.selection_set(row)
+        self.folder_listbox.activate(row)
+        if start != self.index:
+            self.navigate_to(start)
+        else:
+            self._sync_sidebar_selection()
+        self.canvas.focus_set()
+        return "break"
+
+    def _on_sidebar_wheel(self, event: tk.Event, direction: int | None = None) -> str:
+        if not self.folder_groups:
+            return "break"
+        if direction is None:
+            delta = int(getattr(event, "delta", 0))
+            if delta == 0:
+                return "break"
+            steps = -1 if delta > 0 else 1
+            steps *= max(1, abs(delta) // 120)
+        else:
+            steps = -direction
+        self.folder_listbox.yview_scroll(steps, "units")
+        return "break"
+
+    def _on_folder_scroll(self, first: str, last: str) -> None:
+        try:
+            self._folder_yview = (float(first), float(last))
+        except ValueError:
+            return
+        self._draw_sidebar_scrollbar()
+
+    def _draw_sidebar_scrollbar(self) -> None:
+        canvas = getattr(self, "sidebar_scrollbar", None)
+        if canvas is None:
+            return
+        try:
+            canvas.delete("all")
+        except tk.TclError:
+            return
+
+        first, last = self._folder_yview
+        if first <= 0.0 and last >= 1.0:
+            return
+
+        height = canvas.winfo_height()
+        width = canvas.winfo_width()
+        if height <= 2 or width <= 2:
+            return
+
+        top = first * height
+        bottom = last * height
+        minimum = 24
+        if bottom - top < minimum:
+            midpoint = (top + bottom) / 2
+            top = max(0.0, midpoint - minimum / 2)
+            bottom = min(float(height), top + minimum)
+
+        canvas.create_rectangle(
+            1, top, max(2, width - 1), bottom, fill=MUTED_DIM, outline=""
+        )
+
+    def _on_sidebar_scrollbar_click(self, event: tk.Event) -> str:
+        first, last = self._folder_yview
+        visible = last - first
+        if visible <= 0.0 or visible >= 1.0:
+            return "break"
+        height = max(1, self.sidebar_scrollbar.winfo_height())
+        top = event.y / height - visible / 2
+        top = max(0.0, min(1.0 - visible, top))
+        self.folder_listbox.yview_moveto(top)
+        return "break"
 
     def _build_overlay(self) -> None:
         self.overlay = tk.Frame(self.canvas, bg=CANVAS_BG)
@@ -954,6 +1209,7 @@ class PictureViewerApp:
         self.index_label.configure(text="— / —")
         self.zoom_label.configure(text="—")
         self._set_toolbar_state()
+        self._clear_sidebar("尚未打开文件夹", "打开文件夹后\n在这里切换目录")
         self.root.title(APP_NAME)
         self.canvas.configure(cursor="arrow")
 
@@ -1036,6 +1292,7 @@ class PictureViewerApp:
         self._clear_canvas_image()
         self._hide_loading_pill()
         self._set_toolbar_state()
+        self._clear_sidebar("正在扫描…", "正在查找图片…")
         self.canvas.configure(cursor="arrow")
         self.root.title(APP_NAME)
         self.index_label.configure(text="— / —")
@@ -1074,6 +1331,7 @@ class PictureViewerApp:
 
         self.images = images
         self.folder_groups = build_folder_groups(images)
+        self._populate_sidebar()
         initial = self._pending_initial_path
         self._pending_initial_path = None
 
@@ -1122,6 +1380,7 @@ class PictureViewerApp:
         self.folder_groups = []
         self.index = -1
         self._set_toolbar_state()
+        self._clear_sidebar("扫描失败", "无法读取此文件夹")
         self._update_labels(
             file_text="扫描失败",
             folder_text=str(directory),
@@ -1167,6 +1426,7 @@ class PictureViewerApp:
         self.zoom_label.configure(text="…")
         self.root.title(f"{path.name} — {APP_NAME}")
         self._set_toolbar_state()
+        self._sync_sidebar_selection()
 
         self._hide_overlay()
         if self.source is not None:
@@ -1441,6 +1701,16 @@ class PictureViewerApp:
             self.zoom_label.configure(text=format_zoom(self.zoom))
 
     def _on_mousewheel(self, event: tk.Event) -> str:
+        pointer_x = self.folder_listbox.winfo_pointerx()
+        pointer_y = self.folder_listbox.winfo_pointery()
+        list_x = self.folder_listbox.winfo_rootx()
+        list_y = self.folder_listbox.winfo_rooty()
+        if (
+            list_x <= pointer_x < list_x + self.folder_listbox.winfo_width()
+            and list_y <= pointer_y < list_y + self.folder_listbox.winfo_height()
+        ):
+            return self._on_sidebar_wheel(event)
+
         if self.source is None:
             return "break"
         delta = int(event.delta)
@@ -1449,8 +1719,8 @@ class PictureViewerApp:
 
         # Wheel events can be delivered to the focused widget on Windows, so
         # use the actual pointer position and only zoom over the image area.
-        x = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
-        y = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
+        x = pointer_x - self.canvas.winfo_rootx()
+        y = pointer_y - self.canvas.winfo_rooty()
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
         if not (0 <= x < width and 0 <= y < height):
