@@ -1256,16 +1256,13 @@ class PictureViewerApp:
             self._hide_pinned_row()
             return
         try:
-            if not bool(self.folder_tree.item(item_id, "open")):
-                self._hide_pinned_row()
-                return
             bbox = self.folder_tree.bbox(item_id)
         except tk.TclError:
             return
-        if not bbox or bbox[1] < 0:
-            self._show_pinned_row(item_id)
-        else:
+        if bbox and abs(bbox[1]) <= 1:
             self._hide_pinned_row()
+        else:
+            self._show_pinned_row(item_id)
 
     def _show_pinned_row(self, item_id: str) -> None:
         path = self._folder_item_paths.get(item_id)
@@ -1279,6 +1276,7 @@ class PictureViewerApp:
             depth = 0 if str(relative) == "." else len(relative.parts)
 
         text = self.folder_tree.item(item_id, "text")
+        is_open = bool(self.folder_tree.item(item_id, "open"))
         selected = item_id in self.folder_tree.selection()
         background = SIDEBAR_SELECT if selected else SIDEBAR_BG
         foreground = TEXT if selected else MUTED
@@ -1298,13 +1296,26 @@ class PictureViewerApp:
             pass
         canvas.delete("all")
         left = 4 + depth * 15
+        if is_open:
+            triangle = (
+                left,
+                8,
+                left + 8,
+                8,
+                left + 4,
+                13,
+            )
+        else:
+            triangle = (
+                left,
+                6,
+                left,
+                14,
+                left + 6,
+                10,
+            )
         canvas.create_polygon(
-            left,
-            8,
-            left + 8,
-            8,
-            left + 4,
-            13,
+            *triangle,
             fill=foreground,
             outline="",
         )
@@ -1324,8 +1335,13 @@ class PictureViewerApp:
 
     def _on_pinned_row_click(self, _event: tk.Event | None = None) -> str:
         item_id = self._sticky_folder_item
+        was_open = bool(
+            item_id is not None
+            and self.folder_tree.exists(item_id)
+            and self.folder_tree.item(item_id, "open")
+        )
         self._hide_sticky_folder()
-        if item_id is not None and self.folder_tree.exists(item_id):
+        if was_open and item_id is not None:
             self.folder_tree.item(item_id, open=False)
             self.folder_tree.see(item_id)
         self.canvas.focus_set()
