@@ -69,6 +69,7 @@ MAX_ZOOM = 32.0
 WHEEL_FACTOR = 1.15
 FIT_PADDING = 32
 POLL_MS = 30
+WATCH_INTERVAL = 1.5
 
 _SPLIT_DIGITS = re.compile(r"(\d+)")
 
@@ -486,6 +487,8 @@ class PictureViewerApp:
         self._events: queue.Queue = queue.Queue()
         self._loader = ImageLoader(self._events)
         self._last_dir = Path.home()
+        self._watch_stop_event: threading.Event | None = None
+        self._watch_thread: threading.Thread | None = None
 
         self._sidebar_dragging = False
         self._sidebar_drag_origin = 0
@@ -493,6 +496,8 @@ class PictureViewerApp:
         self._sticky_folder_item: str | None = None
         self._sticky_folder_path: Path | None = None
         self._pinned_row_update_job: str | None = None
+        self._context_path: Path | None = None
+        self._toast_after: str | None = None
 
         self._canvas_size = (0, 0)
         self._render_job: str | None = None
@@ -782,6 +787,30 @@ class PictureViewerApp:
             padx=14,
             pady=6,
         )
+        self.toast_label = tk.Label(
+            self.canvas,
+            text="",
+            bg=SURFACE,
+            fg=TEXT,
+            font=self._font(9),
+            padx=14,
+            pady=6,
+        )
+
+        self.context_menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg=SURFACE,
+            fg=TEXT,
+            activebackground=ACCENT,
+            activeforeground=ACCENT_TEXT,
+            borderwidth=0,
+            activeborderwidth=0,
+            font=self._font(9),
+        )
+        self.context_menu.add_command(
+            label="复制路径", command=self._copy_context_path
+        )
 
         footer_rule = tk.Frame(self.root, bg=BORDER, height=1)
         footer_rule.grid(row=3, column=0, sticky="ew")
@@ -947,6 +976,8 @@ class PictureViewerApp:
         self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
 
         self.folder_tree.bind("<ButtonRelease-1>", self._on_sidebar_click)
+        self.folder_tree.bind("<Button-3>", self._on_sidebar_context_menu)
+        self.folder_tree.bind("<Button-2>", self._on_sidebar_context_menu)
         self.folder_tree.bind("<MouseWheel>", self._on_sidebar_wheel)
         self.folder_tree.bind(
             "<Button-4>", lambda event: self._on_sidebar_wheel(event, 1)
@@ -964,6 +995,8 @@ class PictureViewerApp:
             cursor="hand2",
         )
         self.pinned_row.bind("<Button-1>", self._on_pinned_row_click)
+        self.pinned_row.bind("<Button-3>", self._on_pinned_row_context_menu)
+        self.pinned_row.bind("<Button-2>", self._on_pinned_row_context_menu)
 
     def _clear_sidebar(self, summary: str, empty_message: str) -> None:
         self._hide_sticky_folder()
@@ -988,7 +1021,7 @@ class PictureViewerApp:
         else:
             self.sidebar_empty.place_forget()
 
-    def _populate_sidebar(self) -> None:
+    def _populate_sidebar(self, open_paths: set[Path] | None = None) -> None:
         self._hide_sticky_folder()
         children = self.folder_tree.get_children("")
         if children:
@@ -1116,6 +1149,12 @@ class PictureViewerApp:
                     self._image_items_by_path[image_path] = image_item
 
         insert_node(root)
+        if open_paths is not None:
+            for path, item_id in self._folder_items_by_path.items():
+                try:
+                    self.folder_tree.item(item_id, open=path in open_paths)
+                except tk.TclError:
+                    pass
         self.sidebar_empty.place_forget()
         self.sidebar_summary.configure(
             text=(
@@ -1346,6 +1385,67 @@ class PictureViewerApp:
             self.folder_tree.see(item_id)
         self.canvas.focus_set()
         return "break"
+
+    def _on_sidebar_context_menu(self, event: tk.Event) -> str:
+        item_id = self.folder_tree.identify_row(event.y)
+        if not item_id:
+            return "break"
+        image_index = self._image_item_index.get(item_id)
+        if image_index is not None and 0 <= image_index < len(self.images):
+            path = self.images[image_index]
+        else:
+            path = self._folder_item_paths.get(item_id)
+        if path is None:
+            return "break"
+        self._show_path_menu(path, event.x_root, event.y_root)
+        return "break"
+
+    def _on_pinned_row_context_menu(self, event: tk.Event) -> str:
+        path = self._sticky_folder_path
+        if path is not None:
+            self._show_path_menu(path, event.x_root, event.y_root)
+        return "break"
+
+    def _show_path_menu(self, path: Path, x_root: int, y_root: int) -> None:
+        self._context_path = path
+        try:
+            self.context_menu.tk_popup(int(x_root), int(y_root))
+        finally:
+            self.context_menu.grab_release()
+
+    def _copy_context_path(self) -> None:
+        if self._context_path is not None:
+            self._copy_path(self._context_path)
+
+    def _copy_path(self, path: Path) -> None:
+        try:
+            absolute = Path(path).resolve()
+        except OSError:
+            absolute = Path(path)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(str(absolute))
+            self.root.update_idletasks()
+        except tk.TclError:
+            self._show_toast("复制失败")
+            return
+        self._show_toast("路径已复制")
+
+    def _show_toast(self, text: str) -> None:
+        if self._toast_after is not None:
+            try:
+                self.root.after_cancel(self._toast_after)
+            except tk.TclError:
+                pass
+            self._toast_after = None
+        self.toast_label.configure(text=text)
+        self.toast_label.place(relx=0.5, rely=1.0, y=-22, anchor="s")
+        self.toast_label.lift()
+        self._toast_after = self.root.after(1600, self._hide_toast)
+
+    def _hide_toast(self) -> None:
+        self._toast_after = None
+        self.toast_label.place_forget()
 
     def _schedule_tree_item_top(self, item_id: str) -> None:
         try:
@@ -1642,6 +1742,7 @@ class PictureViewerApp:
         self.loading_pill.place_forget()
 
     def _show_welcome(self, message: str | None = None) -> None:
+        self._stop_watcher()
         self._scan_token += 1
         self._load_token += 1
         self.root_path = None
@@ -1725,6 +1826,7 @@ class PictureViewerApp:
             self._show_welcome(f"无法打开文件夹：{directory}")
             return
 
+        self._stop_watcher()
         self._last_dir = directory
         self._scan_token += 1
         scan_token = self._scan_token
@@ -1779,6 +1881,154 @@ class PictureViewerApp:
                 ("scan_failed", token, directory, str(error) or type(error).__name__)
             )
 
+    def _start_watcher(
+        self,
+        token: int,
+        directory: Path,
+        images: list[Path],
+        directories: list[Path],
+    ) -> None:
+        self._stop_watcher()
+        stop_event = threading.Event()
+        self._watch_stop_event = stop_event
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop,
+            args=(token, directory, images, directories, stop_event),
+            name="picture-watcher",
+            daemon=True,
+        )
+        self._watch_thread.start()
+
+    def _stop_watcher(self) -> None:
+        if self._watch_stop_event is not None:
+            self._watch_stop_event.set()
+            self._watch_stop_event = None
+        self._watch_thread = None
+
+    def _watch_loop(
+        self,
+        token: int,
+        directory: Path,
+        images: list[Path],
+        directories: list[Path],
+        stop_event: threading.Event,
+    ) -> None:
+        baseline = (tuple(images), tuple(directories))
+        while not stop_event.wait(WATCH_INTERVAL):
+            try:
+                current_images, current_directories, _errors = scan_tree(directory)
+            except Exception:
+                continue
+            signature = (tuple(current_images), tuple(current_directories))
+            if signature == baseline:
+                continue
+            baseline = signature
+            if stop_event.is_set():
+                return
+            self._events.put(
+                (
+                    "watch_changed",
+                    token,
+                    directory,
+                    current_images,
+                    current_directories,
+                )
+            )
+
+    def _handle_watch_changed(
+        self,
+        token: int,
+        directory: Path,
+        images: list[Path],
+        directories: list[Path],
+    ) -> None:
+        if self._closed or token != self._scan_token:
+            return
+        if self.root_path is None or directory != self.root_path:
+            return
+
+        old_index = self.index
+        old_images = self.images
+        current_path = (
+            old_images[old_index]
+            if 0 <= old_index < len(old_images)
+            else None
+        )
+        open_paths = {
+            path
+            for path, item_id in self._folder_items_by_path.items()
+            if self.folder_tree.exists(item_id)
+            and bool(self.folder_tree.item(item_id, "open"))
+        }
+        old_view = self.folder_tree.yview()
+
+        new_index = -1
+        if current_path is not None:
+            current_key = os.path.normcase(str(current_path))
+            for position, image in enumerate(images):
+                if os.path.normcase(str(image)) == current_key:
+                    new_index = position
+                    break
+
+        self.images = images
+        self.folder_groups = build_folder_groups(images)
+        self.folder_directories = directories
+
+        if new_index >= 0 and self.source is not None:
+            self.index = new_index
+            current_path = images[new_index]
+            self._populate_sidebar(open_paths)
+            self._update_labels(
+                file_text=current_path.name,
+                folder_text=self._folder_display(current_path),
+            )
+            self.index_label.configure(
+                text=f"{self.index + 1} / {len(self.images)}"
+            )
+            self._set_toolbar_state()
+            self.root.title(f"{current_path.name} — {APP_NAME}")
+            self._sync_sticky_to_current_image()
+            self.folder_tree.yview_moveto(old_view[0])
+            self._schedule_pinned_row_update()
+            return
+
+        self._load_token += 1
+        self._hide_loading_pill()
+        self._hide_sticky_folder()
+        self.source = None
+        self.metadata = None
+        self._clear_canvas_image()
+        self.index = -1
+        self._populate_sidebar(open_paths)
+
+        if not images:
+            self._set_toolbar_state()
+            self.zoom_label.configure(text="—")
+            self._update_labels(
+                file_text="没有找到图片",
+                folder_text=str(directory),
+                meta_text="",
+            )
+            self.index_label.configure(text="0 / 0")
+            self.root.title(APP_NAME)
+            self.canvas.configure(cursor="arrow")
+            self._show_overlay(
+                "这里没有图片",
+                f"{directory}\n\n"
+                "没有找到支持的图片文件。请换一个文件夹，"
+                "或确认其中包含 JPG、PNG、WebP 等格式的图片。",
+                primary=("换一个文件夹", self.open_folder_dialog),
+            )
+            return
+
+        if new_index >= 0:
+            target_index = new_index
+        elif old_index >= 0:
+            target_index = min(old_index, len(images) - 1)
+        else:
+            target_index = 0
+        self.navigate_to(target_index)
+
     def _handle_scan_ready(
         self,
         token: int,
@@ -1794,6 +2044,7 @@ class PictureViewerApp:
         self.folder_groups = build_folder_groups(images)
         self.folder_directories = directories
         self._populate_sidebar()
+        self._start_watcher(token, directory, images, directories)
         initial = self._pending_initial_path
         self._pending_initial_path = None
 
@@ -1838,6 +2089,7 @@ class PictureViewerApp:
     ) -> None:
         if self._closed or token != self._scan_token:
             return
+        self._stop_watcher()
         self.images = []
         self.folder_groups = []
         self.folder_directories = []
@@ -1964,6 +2216,10 @@ class PictureViewerApp:
                     )
                 elif kind == "image_failed":
                     self._handle_image_failed(event[1], event[2], event[3])
+                elif kind == "watch_changed":
+                    self._handle_watch_changed(
+                        event[1], event[2], event[3], event[4]
+                    )
         finally:
             if not self._closed:
                 self.root.after(POLL_MS, self._poll_events)
@@ -2368,6 +2624,7 @@ class PictureViewerApp:
         if self._closed:
             return
         self._closed = True
+        self._stop_watcher()
         self._loader.close()
         self.root.destroy()
 
