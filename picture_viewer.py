@@ -18,11 +18,16 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Callable, Sequence
+
+from directory_watch import DirectoryWatch
 
 try:
     from PIL import Image, ImageDraw, ImageOps, ImageTk
@@ -69,7 +74,6 @@ MAX_ZOOM = 32.0
 WHEEL_FACTOR = 1.15
 FIT_PADDING = 32
 POLL_MS = 30
-WATCH_INTERVAL = 1.5
 
 _SPLIT_DIGITS = re.compile(r"(\d+)")
 
@@ -122,7 +126,8 @@ def image_sort_key(path: Path, root: Path) -> tuple:
 
 
 def scan_tree(
-    root: Path, *, skip_hidden: bool = True
+    root: Path, *, skip_hidden: bool = True,
+    previous: tuple[list[Path], list[Path]] | None = None,
 ) -> tuple[list[Path], list[Path], list[str]]:
     """Recursively collect supported images and all visible directories.
 
@@ -134,9 +139,12 @@ def scan_tree(
     images: list[Path] = []
     directories: list[Path] = []
     errors: list[str] = []
+    inaccessible: set[Path] = set()
 
     def on_error(error: OSError) -> None:
         errors.append(str(error))
+        if error.filename and not isinstance(error, FileNotFoundError):
+            inaccessible.add(Path(error.filename))
 
     for dirpath, dirnames, filenames in os.walk(
         root, topdown=True, onerror=on_error, followlinks=False
@@ -148,8 +156,6 @@ def scan_tree(
                 if not name.startswith(".")
                 and name not in {"$RECYCLE.BIN", "System Volume Information"}
             ]
-        dirnames.sort(key=natural_key)
-        filenames.sort(key=natural_key)
         directories.append(Path(dirpath))
 
         for filename in filenames:
@@ -159,10 +165,17 @@ def scan_tree(
             if path.suffix.lower() in SUPPORTED_EXTENSIONS:
                 images.append(path)
 
-    images.sort(key=lambda item: image_sort_key(item, root))
+    if inaccessible and previous:
+        for entries, known in zip((images, directories), previous):
+            entries.extend(
+                path for path in known
+                if any(path.is_relative_to(folder) for folder in inaccessible)
+            )
+
+    images.sort(key=lambda item: (image_sort_key(item, root), item.name))
     directories.sort(
-        key=lambda item: tuple(
-            natural_key(part) for part in item.relative_to(root).parts
+        key=lambda item: (
+            tuple(natural_key(part) for part in item.relative_to(root).parts), item.as_posix()
         )
     )
     return images, directories, errors
@@ -225,6 +238,10 @@ def friendly_image_error(error: Exception) -> str:
 # ---------------------------------------------------------------------------
 
 
+def file_version(stat: os.stat_result) -> tuple[int, int, int]:
+    return stat.st_mtime_ns, stat.st_size, stat.st_ino
+
+
 class ImageLoader:
     """Single background worker that always processes the latest request."""
 
@@ -261,34 +278,76 @@ class ImageLoader:
                 self._request = None
 
             try:
-                with Image.open(path) as opened:
+                with path.open("rb") as stream, Image.open(stream) as opened:
+                    version = file_version(os.fstat(stream.fileno()))
                     image_format = opened.format or path.suffix.lstrip(".").upper()
                     had_alpha = (
                         opened.mode in {"RGBA", "LA", "PA"}
                         or "A" in opened.getbands()
-                        or (opened.mode == "P" and "transparency" in opened.info)
+                        or "transparency" in opened.info
                     )
                     image = ImageOps.exif_transpose(opened)
-                    image = image.convert("RGBA" if had_alpha else "RGB")
+                    mode = "RGBA" if had_alpha else "RGB"
+                    if image.mode != mode:
+                        image = image.convert(mode)
                     image.load()
                     width, height = image.size
-
-                try:
-                    byte_count = path.stat().st_size
-                except OSError:
-                    byte_count = 0
 
                 metadata = {
                     "width": width,
                     "height": height,
                     "format": image_format,
-                    "bytes": byte_count,
+                    "bytes": version[1],
+                    "version": version,
+                    "path": path,
                 }
                 self._events.put(("image_ready", token, path, image, metadata))
             except Exception as error:  # noqa: BLE001 - shown to the user
                 self._events.put(
                     ("image_failed", token, path, friendly_image_error(error))
                 )
+
+
+def render_region(
+    source: Image.Image,
+    box: tuple[int, int, int, int],
+    size: tuple[int, int],
+) -> Image.Image:
+    """Calculate viewport pixels in the worker; the decoded source is read-only."""
+    left, top, right, bottom = box
+    region_size = (right - left, bottom - top)
+    if region_size == size:
+        return source if size == source.size else source.crop(box)
+    shrinking = size[0] < region_size[0] or size[1] < region_size[1]
+    # Pillow premultiplies RGBA before resizing. Limit that work to visible pixels.
+    if source.mode == "RGBA" and region_size != source.size:
+        source = source.crop(box)
+        box = (0, 0, *source.size)
+    return source.resize(
+        size,
+        Image.Resampling.LANCZOS if shrinking else Image.Resampling.BICUBIC,
+        box=box,
+        reducing_gap=2.0 if shrinking else None,
+    )
+
+
+def render_zoom_preview(
+    source: Image.Image,
+    preview: Image.Image | None,
+    box: tuple[int, int, int, int],
+    size: tuple[int, int],
+) -> Image.Image:
+    """Sample just the visible area, using the last fit preview when available."""
+    if preview is None:
+        return source.resize(size, Image.Resampling.NEAREST, box=box)
+    left, top, right, bottom = box
+    preview_box = (
+        left * preview.width / source.width,
+        top * preview.height / source.height,
+        right * preview.width / source.width,
+        bottom * preview.height / source.height,
+    )
+    return preview.resize(size, Image.Resampling.NEAREST, box=preview_box)
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +518,15 @@ def make_app_icon(size: int = 64) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class SidebarFolder:
+    children: list[Path] = field(default_factory=list)
+    start: int = 0
+    end: int = 0
+    first: int = -1
+    total: int = 0
+
+
 class PictureViewerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -488,7 +556,9 @@ class PictureViewerApp:
         self._loader = ImageLoader(self._events)
         self._last_dir = Path.home()
         self._watch_stop_event: threading.Event | None = None
-        self._watch_thread: threading.Thread | None = None
+        self._watch_path: Path | None = None
+        self._requested_version: tuple[int, int, int] | None = None
+        self._preserve_view_token: int | None = None
 
         self._sidebar_dragging = False
         self._sidebar_drag_origin = 0
@@ -501,6 +571,11 @@ class PictureViewerApp:
 
         self._canvas_size = (0, 0)
         self._render_job: str | None = None
+        self._render_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="picture-render")
+        self._render_version = 0
+        self._fit_photo: ImageTk.PhotoImage | None = None
+        self._fit_pixels: Image.Image | None = None
+        self._wheel_job: str | None = None
         self._fit_retry_job: str | None = None
         self._configure_job: str | None = None
         self._dragging = False
@@ -931,6 +1006,10 @@ class PictureViewerApp:
         self._folder_item_paths: dict[str, Path] = {}
         self._image_item_index: dict[str, int] = {}
         self._image_items_by_path: dict[Path, str] = {}
+        self._sidebar_folders: dict[Path, SidebarFolder] = {}
+        self._sidebar_rows: dict[Path, dict[Path, str]] = {}
+        self._sidebar_placeholders: set[str] = set()
+        self._sidebar_jobs: dict[Path, str] = {}
 
         self.folder_tree = ttk.Treeview(
             self.list_area,
@@ -976,6 +1055,7 @@ class PictureViewerApp:
         self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
 
         self.folder_tree.bind("<ButtonRelease-1>", self._on_sidebar_click)
+        self.folder_tree.bind("<<TreeviewOpen>>", self._on_sidebar_open)
         self.folder_tree.bind("<Button-3>", self._on_sidebar_context_menu)
         self.folder_tree.bind("<Button-2>", self._on_sidebar_context_menu)
         self.folder_tree.bind("<MouseWheel>", self._on_sidebar_wheel)
@@ -999,6 +1079,10 @@ class PictureViewerApp:
         self.pinned_row.bind("<Button-2>", self._on_pinned_row_context_menu)
 
     def _clear_sidebar(self, summary: str, empty_message: str) -> None:
+        self._cancel_sidebar_jobs()
+        self._sidebar_folders.clear()
+        self._sidebar_rows.clear()
+        self._sidebar_placeholders.clear()
         self._hide_sticky_folder()
         children = self.folder_tree.get_children("")
         if children:
@@ -1021,151 +1105,185 @@ class PictureViewerApp:
         else:
             self.sidebar_empty.place_forget()
 
-    def _populate_sidebar(self, open_paths: set[Path] | None = None) -> None:
-        self._hide_sticky_folder()
-        children = self.folder_tree.get_children("")
-        if children:
-            self.folder_tree.delete(*children)
-        self._folder_items_by_path.clear()
-        self._folder_first_index.clear()
-        self._folder_item_paths.clear()
-        self._image_item_index.clear()
-        self._image_items_by_path.clear()
+    def _cancel_sidebar_jobs(self) -> None:
+        for job in self._sidebar_jobs.values():
+            self.root.after_cancel(job)
+        self._sidebar_jobs.clear()
 
-        if self.root_path is None:
-            self.sidebar_summary.configure(text="没有可显示的目录")
-            self.sidebar_empty.configure(text="打开文件夹后\n在这里切换目录")
-            self.sidebar_empty.place(relx=0.5, rely=0.38, anchor="center")
-            self._folder_yview = (0.0, 1.0)
-            self._draw_sidebar_scrollbar()
+    def _populate_sidebar(self) -> None:
+        root = self.root_path
+        if root is None:
+            self._clear_sidebar("没有可显示的目录", "打开文件夹后\n在这里切换目录")
             return
 
-        root = self.root_path
-        nodes: dict[Path, dict] = {}
-
-        def ensure_node(path: Path) -> dict:
-            if path not in nodes:
-                nodes[path] = {
-                    "path": path,
-                    "children": set(),
-                    "start": None,
-                    "end": None,
-                }
-            return nodes[path]
-
-        ensure_node(root)
-        directory_paths: set[Path] = {root}
-        for path in self.folder_directories:
-            try:
-                path.relative_to(root)
-            except ValueError:
+        self._cancel_sidebar_jobs()
+        previous = self._sidebar_folders
+        folders = {path: SidebarFolder() for path in self.folder_directories}
+        folders.setdefault(root, SidebarFolder())
+        for path, start, end in self.folder_groups:
+            node = folders[path]
+            node.start, node.end = start, end
+            node.first, node.total = start, end - start
+        for path in sorted(folders, key=lambda p: len(p.parts), reverse=True):
+            if path == root:
                 continue
-            directory_paths.add(path)
-        for path in directory_paths:
-            ensure_node(path)
-            current = path
-            while current != root:
-                parent = current.parent
-                ensure_node(parent)["children"].add(current)
-                current = parent
+            node = folders[path]
+            parent = folders[path.parent]
+            parent.children.append(path)
+            parent.total += node.total
+            if node.first >= 0 and (parent.first < 0 or node.first < parent.first):
+                parent.first = node.first
+        for node in folders.values():
+            node.children.sort(key=lambda path: (natural_key(path.name), path.name))
+        self._sidebar_folders = folders
 
-        for folder, start, end in self.folder_groups:
-            try:
-                folder.relative_to(root)
-            except ValueError:
-                continue
-            node = ensure_node(folder)
-            node["start"] = start
-            node["end"] = end
-            current = folder
-            while current != root:
-                parent = current.parent
-                ensure_node(parent)["children"].add(current)
-                current = parent
+        # Retain Treeview IDs, expansion and focus across filesystem changes.
+        for item_id, old_path in tuple(self._folder_item_paths.items()):
+            if old_path in folders:
+                node = folders[old_path]
+                self._folder_first_index[item_id] = node.first
+                if previous[old_path].total != node.total:
+                    self.folder_tree.item(item_id, text=self._folder_label(old_path))
+                self._update_sidebar_placeholder(old_path)
+        if root not in self._folder_items_by_path:
+            self._add_sidebar_folder(root, "", "end")
+            self.folder_tree.item(self._folder_items_by_path[root], open=True)
+            self._expand_sidebar_folder(root)
+        else:
+            for path in tuple(self._sidebar_rows):
+                if path in self._sidebar_rows and path in folders:
+                    self._refresh_sidebar_branch(path, previous.get(path))
 
-        def prepare(path: Path) -> tuple[int | None, int]:
-            node = nodes[path]
-            direct = (
-                node["end"] - node["start"]
-                if node["start"] is not None
-                else 0
-            )
-            first = node["start"]
-            ordered = sorted(
-                node["children"],
-                key=lambda item: (natural_key(item.name), item.name),
-            )
-            for child in ordered:
-                child_first, child_total = prepare(child)
-                if child_first is not None and (
-                    first is None or child_first < first
-                ):
-                    first = child_first
-                direct += child_total
-            node["ordered"] = ordered
-            node["first"] = first
-            node["total"] = direct
-            return first, direct
-
-        prepare(root)
-
-        counter = 0
-
-        def insert_node(path: Path, parent_id: str = "") -> None:
-            nonlocal counter
-            node = nodes[path]
-            label = root.name if path == root else path.name
-            if not label:
-                label = str(path)
-            item_id = f"folder-{counter}"
-            counter += 1
-            item_text = f"{label}    ·  {node['total']}"
-            self.folder_tree.insert(
-                parent_id,
-                "end",
-                iid=item_id,
-                text=item_text,
-                open=(path == root),
-            )
-            self._folder_items_by_path[path] = item_id
-            self._folder_first_index[item_id] = (
-                int(node["first"]) if node["first"] is not None else -1
-            )
-            self._folder_item_paths[item_id] = path
-            for child in node["ordered"]:
-                insert_node(child, item_id)
-            if node["start"] is not None:
-                for image_index in range(node["start"], node["end"]):
-                    image_path = self.images[image_index]
-                    image_item = f"image-{counter}"
-                    counter += 1
-                    self.folder_tree.insert(
-                        item_id,
-                        "end",
-                        iid=image_item,
-                        text=image_path.name,
-                    )
-                    self._image_item_index[image_item] = image_index
-                    self._image_items_by_path[image_path] = image_item
-
-        insert_node(root)
-        if open_paths is not None:
-            for path, item_id in self._folder_items_by_path.items():
-                try:
-                    self.folder_tree.item(item_id, open=path in open_paths)
-                except tk.TclError:
-                    pass
         self.sidebar_empty.place_forget()
-        self.sidebar_summary.configure(
-            text=(
-                f"{len(nodes)} 个目录"
-                f"  ·  {len(self.images)} 张图片"
-            )
-        )
-        self.folder_tree.yview_moveto(0)
-        self._folder_yview = (0.0, 1.0)
-        self._draw_sidebar_scrollbar()
+        self.sidebar_summary.configure(text=f"{len(folders)} 个目录  ·  {len(self.images)} 张图片")
         self._sync_sidebar_selection()
+
+    def _folder_label(self, path: Path) -> str:
+        return f"{path.name or path}    ·  {self._sidebar_folders[path].total}"
+
+    def _update_sidebar_placeholder(self, path: Path) -> None:
+        # A closed folder needs one child for Tk to show its expand indicator.
+        item_id = self._folder_items_by_path[path]
+        node = self._sidebar_folders[path]
+        needs_placeholder = path not in self._sidebar_rows and bool(
+            node.children or node.end > node.start
+        )
+        if needs_placeholder and item_id not in self._sidebar_placeholders:
+            self.folder_tree.insert(item_id, "end", iid=f"placeholder-{item_id}")
+            self._sidebar_placeholders.add(item_id)
+        elif not needs_placeholder and item_id in self._sidebar_placeholders:
+            self.folder_tree.delete(f"placeholder-{item_id}")
+            self._sidebar_placeholders.remove(item_id)
+
+    def _add_sidebar_folder(self, path: Path, parent: str, position: int | str) -> str:
+        item_id = self.folder_tree.insert(parent, position, text=self._folder_label(path))
+        self._folder_items_by_path[path] = item_id
+        self._folder_item_paths[item_id] = path
+        self._folder_first_index[item_id] = self._sidebar_folders[path].first
+        self._update_sidebar_placeholder(path)
+        return item_id
+
+    def _forget_sidebar_row(self, path: Path, item_id: str) -> None:
+        if item_id in self._folder_item_paths:
+            self._folder_item_paths.pop(item_id)
+            self._folder_items_by_path.pop(path)
+            self._folder_first_index.pop(item_id)
+            self._sidebar_placeholders.discard(item_id)
+            job = self._sidebar_jobs.pop(path, None)
+            if job is not None:
+                self.root.after_cancel(job)
+            for child, child_id in self._sidebar_rows.pop(path, {}).items():
+                self._forget_sidebar_row(child, child_id)
+        else:
+            self._image_items_by_path.pop(path)
+            self._image_item_index.pop(item_id)
+
+    def _add_sidebar_image(self, index: int, position: int | str) -> str:
+        path = self.images[index]
+        item_id = self.folder_tree.insert(
+            self._folder_items_by_path[path.parent], position, text=path.name
+        )
+        self._sidebar_rows[path.parent][path] = item_id
+        self._image_items_by_path[path] = item_id
+        self._image_item_index[item_id] = index
+        return item_id
+
+    def _on_sidebar_open(self, _event: tk.Event) -> None:
+        path = self._folder_item_paths.get(self.folder_tree.focus())
+        if path is not None:
+            self._expand_sidebar_folder(path)
+
+    def _expand_sidebar_folder(self, path: Path) -> None:
+        if path not in self._sidebar_rows:
+            self._sidebar_rows[path] = {}
+            self._update_sidebar_placeholder(path)
+            self._refresh_sidebar_branch(path)
+
+    def _refresh_sidebar_branch(self, path: Path, previous: SidebarFolder | None = None) -> None:
+        node = self._sidebar_folders[path]
+        rows = self._sidebar_rows[path]
+        folder_item = self._folder_items_by_path[path]
+        wanted = {child: child for child in node.children}
+        wanted.update((image, image) for image in self.images[node.start:node.end])
+        for old_path, item_id in tuple(rows.items()):
+            if old_path not in wanted or (
+                (old_path in self._sidebar_folders) != (item_id in self._folder_item_paths)
+            ):
+                self._forget_sidebar_row(old_path, item_id)
+                self.folder_tree.delete(item_id)
+                del rows[old_path]
+            elif item_id in self._image_item_index and old_path.name != wanted[old_path].name:
+                new_path = wanted[old_path]
+                self.folder_tree.item(item_id, text=new_path.name)
+                del rows[old_path]
+                rows[new_path] = item_id
+
+        for pos, child in enumerate(node.children):
+            if child not in rows:
+                rows[child] = self._add_sidebar_folder(
+                    child, folder_item, pos if pos < len(rows) else "end"
+                )
+            elif self._folder_item_paths[rows[child]].name != child.name:
+                self._folder_item_paths[rows[child]] = child
+                self.folder_tree.item(rows[child], text=self._folder_label(child))
+
+        # Updates to unaffected rows only change their Python index. Avoid a Tcl
+        # call for each existing picture when inserting a file earlier in the list.
+        pending: list[int] = []
+        previous_index = -1
+        reordered = False
+        if previous and previous.children != node.children:
+            old_folders = set(previous.children)
+            reordered = (
+                [child for child in previous.children if child in self._sidebar_folders]
+                != [child for child in node.children if child in old_folders]
+            )
+        for index in range(node.start, node.end):
+            image_path = self.images[index]
+            item_id = rows.get(image_path)
+            if item_id is None:
+                pending.append(index)
+            else:
+                old_index = self._image_item_index[item_id]
+                reordered |= old_index < previous_index
+                previous_index = old_index
+                self._image_item_index[item_id] = index
+
+        def insert_batch(offset: int = 0) -> None:
+            self._sidebar_jobs.pop(path, None)
+            for index in pending[offset:offset + 128]:
+                image_path = self.images[index]
+                if image_path not in rows:
+                    pos = len(node.children) + index - node.start
+                    self._add_sidebar_image(index, pos if pos < len(rows) else "end")
+            offset += 128
+            if offset < len(pending):
+                self._sidebar_jobs[path] = self.root.after(1, insert_batch, offset)
+            elif reordered:
+                self.folder_tree.set_children(folder_item, *(rows[child] for child in wanted))
+
+        if pending or reordered:
+            insert_batch()
 
     def _sync_sidebar_selection(self) -> None:
         if not self.images or self.index < 0:
@@ -1174,21 +1292,29 @@ class PictureViewerApp:
                 self.folder_tree.selection_remove(*selection)
             return
         current_image = self.images[self.index]
+        if not self._sidebar_folders:
+            return
+        relative = current_image.parent.relative_to(self.root_path)
+        ancestor = self.root_path
+        for part in relative.parts:
+            self._expand_sidebar_folder(ancestor)
+            self.folder_tree.item(self._folder_items_by_path[ancestor], open=True)
+            ancestor = ancestor / part
         folder_item = self._folder_items_by_path.get(current_image.parent)
         if folder_item is None:
             return
 
-        parent = self.folder_tree.parent(folder_item)
-        while parent:
-            self.folder_tree.item(parent, open=True)
-            parent = self.folder_tree.parent(parent)
-
         item_id = folder_item
-        image_item = self._image_items_by_path.get(current_image)
-        if image_item is not None and bool(
-            self.folder_tree.item(folder_item, "open")
-        ):
-            item_id = image_item
+        if self.folder_tree.item(folder_item, "open"):
+            self._expand_sidebar_folder(current_image.parent)
+            item_id = self._image_items_by_path.get(current_image)
+            if item_id is None:
+                # Jumping ahead while a large branch is still being populated.
+                position = sum(
+                    self._image_item_index.get(row, -1) < self.index
+                    for row in self._sidebar_rows[current_image.parent].values()
+                )
+                item_id = self._add_sidebar_image(self.index, position)
 
         selection = self.folder_tree.selection()
         if selection:
@@ -1230,6 +1356,7 @@ class PictureViewerApp:
         was_open = bool(self.folder_tree.item(item_id, "open"))
         if had_children:
             if not was_open:
+                self._expand_sidebar_folder(self._folder_item_paths[item_id])
                 self.folder_tree.item(item_id, open=True)
             self._sync_sticky_to_current_image()
 
@@ -1863,77 +1990,79 @@ class PictureViewerApp:
             f"{directory}\n\n正在查找其中的图片…",
         )
 
+        self._watch_path = None
+        stop_event = threading.Event()
+        self._watch_stop_event = stop_event
         threading.Thread(
             target=self._scan_worker,
-            args=(scan_token, directory),
+            args=(scan_token, directory, stop_event),
             name="picture-scanner",
             daemon=True,
         ).start()
 
-    def _scan_worker(self, token: int, directory: Path) -> None:
+    def _scan_worker(self, token: int, directory: Path, stop: threading.Event) -> None:
+        # Register before scanning so edits made during discovery are queued.
+        watch = DirectoryWatch(directory)
         try:
             images, directories, errors = scan_tree(directory)
+            if stop.is_set():
+                return
             self._events.put(
                 ("scan_ready", token, directory, images, directories, errors)
             )
+            retry_at = time.monotonic() + 30 if errors else None
+            while not stop.is_set():
+                names_changed, contents_changed = watch.wait(stop, retry_at)
+                if stop.is_set():
+                    return
+                if names_changed:
+                    try:
+                        updated, folders, errors = scan_tree(
+                            directory, previous=(images, directories)
+                        )
+                    except OSError:
+                        retry_at = time.monotonic() + 30
+                        continue
+                    retry_at = time.monotonic() + 30 if errors else None
+                    # Windows Path equality ignores spelling-only renames.
+                    if (
+                        len(updated) != len(images) or len(folders) != len(directories)
+                        or any(str(a) != str(b) for a, b in zip(updated, images))
+                        or any(str(a) != str(b) for a, b in zip(folders, directories))
+                    ):
+                        self._events.put(("watch_changed", token, directory, updated, folders))
+                    images, directories = updated, folders
+                path = self._watch_path
+                if contents_changed and path is not None:
+                    try:
+                        version = file_version(path.stat())
+                    except OSError:
+                        continue
+                    self._events.put(("file_version", token, path, version))
         except Exception as error:  # noqa: BLE001 - shown to the user
             self._events.put(
                 ("scan_failed", token, directory, str(error) or type(error).__name__)
             )
-
-    def _start_watcher(
-        self,
-        token: int,
-        directory: Path,
-        images: list[Path],
-        directories: list[Path],
-    ) -> None:
-        self._stop_watcher()
-        stop_event = threading.Event()
-        self._watch_stop_event = stop_event
-        self._watch_thread = threading.Thread(
-            target=self._watch_loop,
-            args=(token, directory, images, directories, stop_event),
-            name="picture-watcher",
-            daemon=True,
-        )
-        self._watch_thread.start()
+        finally:
+            watch.close()
 
     def _stop_watcher(self) -> None:
         if self._watch_stop_event is not None:
             self._watch_stop_event.set()
             self._watch_stop_event = None
-        self._watch_thread = None
 
-    def _watch_loop(
-        self,
-        token: int,
-        directory: Path,
-        images: list[Path],
-        directories: list[Path],
-        stop_event: threading.Event,
+    def _handle_file_version(
+        self, token: int, path: Path, version: tuple[int, int, int]
     ) -> None:
-        baseline = (tuple(images), tuple(directories))
-        while not stop_event.wait(WATCH_INTERVAL):
-            try:
-                current_images, current_directories, _errors = scan_tree(directory)
-            except Exception:
-                continue
-            signature = (tuple(current_images), tuple(current_directories))
-            if signature == baseline:
-                continue
-            baseline = signature
-            if stop_event.is_set():
-                return
-            self._events.put(
-                (
-                    "watch_changed",
-                    token,
-                    directory,
-                    current_images,
-                    current_directories,
-                )
-            )
+        if token != self._scan_token or path != self._watch_path:
+            return
+        if version == self._requested_version:
+            return
+        self._requested_version = version
+        self._load_token += 1
+        if self.source is not None and self.metadata and self.metadata["path"] == path:
+            self._preserve_view_token = self._load_token
+        self._loader.request(self._load_token, path)
 
     def _handle_watch_changed(
         self,
@@ -1954,12 +2083,6 @@ class PictureViewerApp:
             if 0 <= old_index < len(old_images)
             else None
         )
-        open_paths = {
-            path
-            for path, item_id in self._folder_items_by_path.items()
-            if self.folder_tree.exists(item_id)
-            and bool(self.folder_tree.item(item_id, "open"))
-        }
         old_view = self.folder_tree.yview()
 
         new_index = -1
@@ -1974,10 +2097,11 @@ class PictureViewerApp:
         self.folder_groups = build_folder_groups(images)
         self.folder_directories = directories
 
-        if new_index >= 0 and self.source is not None:
+        if new_index >= 0:
             self.index = new_index
             current_path = images[new_index]
-            self._populate_sidebar(open_paths)
+            self._watch_path = current_path
+            self._populate_sidebar()
             self._update_labels(
                 file_text=current_path.name,
                 folder_text=self._folder_display(current_path),
@@ -1993,13 +2117,14 @@ class PictureViewerApp:
             return
 
         self._load_token += 1
+        self._watch_path = None
         self._hide_loading_pill()
         self._hide_sticky_folder()
         self.source = None
         self.metadata = None
         self._clear_canvas_image()
         self.index = -1
-        self._populate_sidebar(open_paths)
+        self._populate_sidebar()
 
         if not images:
             self._set_toolbar_state()
@@ -2021,13 +2146,7 @@ class PictureViewerApp:
             )
             return
 
-        if new_index >= 0:
-            target_index = new_index
-        elif old_index >= 0:
-            target_index = min(old_index, len(images) - 1)
-        else:
-            target_index = 0
-        self.navigate_to(target_index)
+        self.navigate_to(max(0, min(old_index, len(images) - 1)))
 
     def _handle_scan_ready(
         self,
@@ -2043,13 +2162,12 @@ class PictureViewerApp:
         self.images = images
         self.folder_groups = build_folder_groups(images)
         self.folder_directories = directories
-        self._populate_sidebar()
-        self._start_watcher(token, directory, images, directories)
         initial = self._pending_initial_path
         self._pending_initial_path = None
 
         if not images:
             self.index = -1
+            self._populate_sidebar()
             self._set_toolbar_state()
             detail = ""
             if errors:
@@ -2083,6 +2201,7 @@ class PictureViewerApp:
         if errors:
             self.root.title(APP_NAME)
         self.navigate_to(start_index)
+        self._populate_sidebar()
 
     def _handle_scan_failed(
         self, token: int, directory: Path, message: str
@@ -2131,6 +2250,8 @@ class PictureViewerApp:
         self._load_token += 1
         token = self._load_token
         path = self.images[index]
+        self._watch_path = path
+        self._requested_version = None
 
         self._update_labels(
             file_text=path.name,
@@ -2220,6 +2341,8 @@ class PictureViewerApp:
                     self._handle_watch_changed(
                         event[1], event[2], event[3], event[4]
                     )
+                elif kind == "file_version":
+                    self._handle_file_version(event[1], event[2], event[3])
         finally:
             if not self._closed:
                 self.root.after(POLL_MS, self._poll_events)
@@ -2231,8 +2354,9 @@ class PictureViewerApp:
             return
 
         self.source = image
+        self._reset_render_cache()
         self.metadata = metadata
-        self.fit_mode = True
+        self._requested_version = metadata["version"]
         self._hide_loading_pill()
         self._hide_overlay()
         self.zoom_label.configure(text="…")
@@ -2248,7 +2372,12 @@ class PictureViewerApp:
         except tk.TclError:
             pass
         self._set_toolbar_state()
-        self._fit_to_window_now()
+        if token == self._preserve_view_token and not self.fit_mode:
+            self._clamp_offsets()
+            self._update_zoom_label()
+            self._schedule_render()
+        else:
+            self._fit_to_window_now()
         self._sync_sticky_to_current_image()
 
     def _handle_image_failed(self, token: int, path: Path, message: str) -> None:
@@ -2393,7 +2522,9 @@ class PictureViewerApp:
         self._schedule_render()
         return "break"
 
-    def _zoom_to(self, new_zoom: float, anchor_x: float, anchor_y: float) -> None:
+    def _zoom_to(
+        self, new_zoom: float, anchor_x: float, anchor_y: float, *, wheel: bool = False
+    ) -> None:
         if self.source is None:
             return
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, new_zoom))
@@ -2408,6 +2539,14 @@ class PictureViewerApp:
         self.offset_y = anchor_y - image_y * new_zoom
         self._clamp_offsets()
         self._update_zoom_label()
+        if wheel:
+            if self._wheel_job is not None:
+                self.root.after_cancel(self._wheel_job)
+            self._wheel_job = self.root.after(100, self._finish_wheel_zoom)
+        self._schedule_render()
+
+    def _finish_wheel_zoom(self) -> None:
+        self._wheel_job = None
         self._schedule_render()
 
     def zoom_by(self, factor: float) -> None:
@@ -2451,14 +2590,14 @@ class PictureViewerApp:
 
         steps = delta if sys.platform == "darwin" else delta / 120.0
         factor = WHEEL_FACTOR**steps
-        self._zoom_to(self.zoom * factor, x, y)
+        self._zoom_to(self.zoom * factor, x, y, wheel=True)
         return "break"
 
     def _on_linux_wheel(self, event: tk.Event, direction: int) -> str:
         if self.source is None:
             return "break"
         factor = WHEEL_FACTOR**direction
-        self._zoom_to(self.zoom * factor, event.x, event.y)
+        self._zoom_to(self.zoom * factor, event.x, event.y, wheel=True)
         return "break"
 
     def _on_double_click(self, event: tk.Event) -> str:
@@ -2503,9 +2642,14 @@ class PictureViewerApp:
             return
         delta_x = event.x - self._drag_origin[0]
         delta_y = event.y - self._drag_origin[1]
+        old_x, old_y = self.offset_x, self.offset_y
         self.offset_x = self._drag_offset[0] + delta_x
         self.offset_y = self._drag_offset[1] + delta_y
         self._clamp_offsets()
+        if (self.offset_x, self.offset_y) == (old_x, old_y):
+            return
+        if self._canvas_image is not None:
+            self.canvas.move(self._canvas_image, self.offset_x - old_x, self.offset_y - old_y)
         self._schedule_render()
 
     def _on_drag_end(self, _event: tk.Event) -> None:
@@ -2513,8 +2657,6 @@ class PictureViewerApp:
             return
         self._dragging = False
         self.canvas.configure(cursor="fleur" if self.source is not None else "arrow")
-        if self.source is not None:
-            self._schedule_render()
 
     def _on_canvas_configure(self, event: tk.Event) -> None:
         new_size = (event.width, event.height)
@@ -2545,6 +2687,7 @@ class PictureViewerApp:
     # -- rendering --------------------------------------------------------
 
     def _schedule_render(self) -> None:
+        self._render_version += 1
         if self._render_job is None and not self._closed:
             self._render_job = self.root.after(8, self._render)
 
@@ -2579,25 +2722,69 @@ class PictureViewerApp:
         target_width = max(1, round((source_right - source_left) * scale))
         target_height = max(1, round((source_bottom - source_top) * scale))
 
-        region = self.source.crop(
-            (source_left, source_top, source_right, source_bottom)
-        )
-        if region.size != (target_width, target_height):
-            resampling = (
-                Image.Resampling.LANCZOS
-                if scale < 1.0
-                else Image.Resampling.BICUBIC
-            )
-            region = region.resize(
-                (target_width, target_height),
-                resampling,
-                reducing_gap=2.0 if scale < 1.0 else None,
-            )
-
-        self._photo = ImageTk.PhotoImage(region)
+        box = (source_left, source_top, source_right, source_bottom)
+        size = (target_width, target_height)
         draw_x = self.offset_x + source_left * scale
         draw_y = self.offset_y + source_top * scale
+        cache_fit = self.fit_mode and box == (0, 0, image_width, image_height)
+        if cache_fit and self._fit_photo is not None:
+            if (self._fit_photo.width(), self._fit_photo.height()) == size:
+                self._display_photo(self._fit_photo, draw_x, draw_y)
+                return
 
+        preview_source = None
+        if self._wheel_job is not None and not self.fit_mode:
+            preview_source = self.source
+            future = self._render_pool.submit(
+                render_zoom_preview, self.source, self._fit_pixels, box, size
+            )
+        else:
+            future = self._render_pool.submit(render_region, self.source, box, size)
+        self._render_job = self.root.after(
+            8, self._finish_render, future, self._render_version, draw_x, draw_y,
+            cache_fit, preview_source,
+        )
+
+    def _finish_render(
+        self, future: Future, version: int, x: float, y: float, cache_fit: bool,
+        preview_source: Image.Image | None = None,
+    ) -> None:
+        if self._closed:
+            return
+        if not future.done():
+            self._render_job = self.root.after(
+                8, self._finish_render, future, version, x, y, cache_fit, preview_source
+            )
+            return
+        self._render_job = None
+        newer_view = version != self._render_version
+        # Keep showing progress during continuous wheel input. The one worker
+        # completes previews in order, and the next frame uses the latest view.
+        wheel_active = (
+            preview_source is not None
+            and preview_source is self.source
+            and self._wheel_job is not None
+            and not self.fit_mode
+        )
+        if newer_view and not wheel_active:
+            self._render()
+            return
+        try:
+            pixels = future.result()
+            photo = ImageTk.PhotoImage(pixels)
+        except (OSError, ValueError, MemoryError, tk.TclError) as error:
+            self._clear_canvas_image()
+            self._show_toast(f"无法显示图片：{friendly_image_error(error)}")
+            return
+        if cache_fit:
+            self._fit_photo = photo
+            self._fit_pixels = pixels
+        self._display_photo(photo, x, y)
+        if newer_view:
+            self._render()
+
+    def _display_photo(self, photo: ImageTk.PhotoImage, draw_x: float, draw_y: float) -> None:
+        self._photo = photo
         if self._canvas_image is None:
             self._canvas_image = self.canvas.create_image(
                 draw_x,
@@ -2609,7 +2796,16 @@ class PictureViewerApp:
             self.canvas.coords(self._canvas_image, draw_x, draw_y)
             self.canvas.itemconfigure(self._canvas_image, image=self._photo)
 
+    def _reset_render_cache(self) -> None:
+        self._render_version += 1
+        self._fit_photo = None
+        self._fit_pixels = None
+        if self._wheel_job is not None:
+            self.root.after_cancel(self._wheel_job)
+            self._wheel_job = None
+
     def _clear_canvas_image(self) -> None:
+        self._reset_render_cache()
         if self._canvas_image is not None:
             try:
                 self.canvas.delete(self._canvas_image)
@@ -2626,6 +2822,7 @@ class PictureViewerApp:
         self._closed = True
         self._stop_watcher()
         self._loader.close()
+        self._render_pool.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
 
