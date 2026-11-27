@@ -9,12 +9,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -m PyInstaller --version >nul 2>nul
-if errorlevel 1 (
-    echo Installing PyInstaller...
-    python -m pip install pyinstaller
-    if errorlevel 1 goto :failed
-)
+echo Checking build and runtime dependencies...
+python -m pip install -r requirements-build.txt
+if errorlevel 1 goto :failed
 
 if not exist "assets\pictureviewer.ico" (
     echo Missing assets\pictureviewer.ico
